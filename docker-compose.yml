@@ -1,0 +1,52 @@
+services:
+  9router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NINEROUTER_VERSION: ${NINEROUTER_VERSION:-latest}
+    image: ${IMAGE_NAME:-9router-local}:${IMAGE_TAG:-latest}
+    pull_policy: never
+    container_name: 9router
+    restart: unless-stopped
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    ports:
+      - "${NINE_ROUTER_BIND:-127.0.0.1}:${NINE_ROUTER_PORT:-20128}:${NINE_ROUTER_PORT:-20128}"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      PORT: ${NINE_ROUTER_PORT:-20128}
+      HOSTNAME: ${NINE_ROUTER_HOSTNAME:-0.0.0.0}
+      NODE_ENV: ${NODE_ENV:-production}
+      JWT_SECRET: ${JWT_SECRET:-}
+      INITIAL_PASSWORD: ${INITIAL_PASSWORD:-}
+      BASE_URL: ${BASE_URL:-}
+      CLOUD_URL: ${CLOUD_URL:-}
+      NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-}
+      NEXT_PUBLIC_CLOUD_URL: ${NEXT_PUBLIC_CLOUD_URL:-}
+      API_KEY_SECRET: ${API_KEY_SECRET:-}
+      MACHINE_ID_SALT: ${MACHINE_ID_SALT:-}
+      ENABLE_REQUEST_LOGS: ${ENABLE_REQUEST_LOGS:-false}
+      DEBUG: ${DEBUG:-false}
+      HEADROOM_URL: ${HEADROOM_URL:-}
+      HOME: /app/data
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf --connect-timeout 5 \"http://127.0.0.1:$${PORT:-20128}/\" >/dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "1.5"
+        reservations:
+          memory: 256M
