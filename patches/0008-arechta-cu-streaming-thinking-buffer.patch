@@ -1,0 +1,149 @@
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index fe0e665..97c60b9 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -11,6 +11,7 @@ import {
+   normalizeCursorModelId,
+   resolveCursorUpstreamModel,
+   mergeCursorAssistantRaw,
++  mergeCursorAssistantRawForStreaming,
+   shouldPromoteThinkingToContent,
+ } from "../utils/cursorModel.js";
+ import {
+@@ -223,6 +224,10 @@ function buildRawAssistantText(totalContent, totalThinking) {
+   return mergeCursorAssistantRaw(totalContent, totalThinking);
+ }
+ 
++function buildStreamingRawAssistantText(totalContent, totalThinking) {
++  return mergeCursorAssistantRawForStreaming(totalContent, totalThinking);
++}
++
+ function emitContentDelta(chunks, { responseId, created, model, deltaContent, toolCallsLength, hasReasoning }) {
+   if (!deltaContent) return;
+   chunks.push(chatChunkSse({
+@@ -760,7 +765,7 @@ export class CursorExecutor extends BaseExecutor {
+       }
+ 
+       if (result.text || result.thinking) {
+-        streamFilter.setRaw(buildRawAssistantText(totalContent, totalThinking));
++        streamFilter.setRaw(buildStreamingRawAssistantText(totalContent, totalThinking));
+         const deltaReasoning = streamFilter.getReasoningDelta();
+         emitReasoningDelta(chunks, {
+           responseId,
+diff --git a/open-sse/utils/cursorModel.js b/open-sse/utils/cursorModel.js
+index 7910951..59121ea 100644
+--- a/open-sse/utils/cursorModel.js
++++ b/open-sse/utils/cursorModel.js
+@@ -116,11 +116,28 @@ export function mergeCursorAssistantRaw(totalContent, totalThinking) {
+   return `${thinking}${content}`;
+ }
+ 
++/**
++ * Streaming variant: Cursor often sends visible answer + tool wire in the thinking
++ * protobuf field. Until a closing/final marker arrives, treat it as reasoning so
++ * partial chunks do not leak into visible content.
++ * @param {string} totalContent
++ * @param {string} totalThinking
++ * @returns {string}
++ */
++export function mergeCursorAssistantRawForStreaming(totalContent, totalThinking) {
++  const content = totalContent || "";
++  const thinking = totalThinking || "";
++  if (content) return mergeCursorAssistantRaw(content, thinking);
++  if (!thinking) return "";
++  if (hasCursorThinkingMarkers(thinking)) return thinking;
++  return `${REDACTED_THINKING_BEGIN}${thinking}`;
++}
++
+ function splitCursorHeuristicFallback(raw) {
+   const finalIdx = raw.indexOf(FINAL_TAG);
+   if (finalIdx >= 0) {
+     return {
+-      reasoning: raw.slice(0, finalIdx).trim(),
++      reasoning: stripThinkingBegin(raw.slice(0, finalIdx)).trim(),
+       content: raw.slice(finalIdx + FINAL_TAG.length).trimStart(),
+     };
+   }
+diff --git a/tests/unit/cursor-default.test.js b/tests/unit/cursor-default.test.js
+index 1d8a588..520cfe4 100644
+--- a/tests/unit/cursor-default.test.js
++++ b/tests/unit/cursor-default.test.js
+@@ -29,6 +29,22 @@ function cursorResponseFrame({ text = "", thinking = "" }) {
+   return Buffer.from(wrapConnectRPCFrame(envelope));
+ }
+ 
++function cursorResponseFrames(parts) {
++  return Buffer.concat(parts.map((part) => cursorResponseFrame(part)));
++}
++
++async function collectSseDeltas(response) {
++  const sse = await response.text();
++  const deltas = [];
++  for (const line of sse.split("\n")) {
++    if (!line.startsWith("data: ")) continue;
++    const payload = line.slice(6).trim();
++    if (!payload || payload === "[DONE]") continue;
++    deltas.push(JSON.parse(payload).choices[0].delta);
++  }
++  return deltas;
++}
++
+ describe("cursorModel helpers", () => {
+   it("splits reasoning before </think>", () => {
+     const raw = "planning step</think>Visible answer";
+@@ -167,4 +183,55 @@ describe("CursorExecutor default model responses", () => {
+     expect(payload.choices[0].message.content).toBe("hidden");
+     expect(payload.choices[0].message.reasoning_content).toBeUndefined();
+   });
++
++  it("does not leak partial thinking chunks as streaming content before </think>", async () => {
++    const executor = new CursorExecutor();
++    const buffer = cursorResponseFrames([
++      { thinking: "Glob failed due to path - let me try absolute" },
++      { thinking: " path for listing the skill files.\n</think>" },
++      {
++        thinking: [
++          "\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>",
++          "Glob",
++          "<｜tool▁sep｜>glob_pattern",
++          "**/*",
++          "<｜tool▁sep｜>target_directory",
++          "/home/arechta/.agents/skills/arechta-backend-nest",
++          "<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
++        ].join("\n"),
++      },
++    ]);
++
++    const response = executor.transformProtobufToSSE(buffer, "cu/default", {
++      messages: [{ role: "user", content: "load skill" }],
++    });
++    const deltas = await collectSseDeltas(response);
++    const content = deltas.map((delta) => delta.content || "").join("");
++    const reasoning = deltas.map((delta) => delta.reasoning_content || "").join("");
++    const toolCallDeltas = deltas.flatMap((delta) => delta.tool_calls || []);
++
++    expect(content).toBe("");
++    expect(reasoning).toContain("Glob failed due to path");
++    expect(toolCallDeltas).toHaveLength(1);
++    expect(toolCallDeltas[0].function.name).toBe("Glob");
++  });
++
++  it("starts streaming visible content only after final marker in thinking field", async () => {
++    const executor = new CursorExecutor();
++    const buffer = cursorResponseFrames([
++      { thinking: "The user asked to load" },
++      { thinking: " the skill.\n</think><｜final｜>**`arechta-backend-nest`** loaded." },
++    ]);
++
++    const response = executor.transformProtobufToSSE(buffer, "cu/default", {
++      messages: [{ role: "user", content: "load skill" }],
++    });
++    const deltas = await collectSseDeltas(response);
++    const content = deltas.map((delta) => delta.content || "").join("");
++    const reasoning = deltas.map((delta) => delta.reasoning_content || "").join("");
++
++    expect(content).toBe("**`arechta-backend-nest`** loaded.");
++    expect(content).not.toContain("The user");
++    expect(reasoning).toContain("The user asked to load the skill");
++  });
+ });

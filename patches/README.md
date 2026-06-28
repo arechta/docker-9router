@@ -46,6 +46,23 @@ CURSOR_STREAM_DEBUG=1
 ls -lt /opt/docker/9router/data/logs/cursor/
 ```
 
+## `0008-arechta-cu-streaming-thinking-buffer.patch`
+
+Fixes live streaming leak where Cursor `thinking` protobuf chunks were emitted as visible `delta.content` before `</think>` / `<|final|>` arrived.
+
+Requires `0001` through `0007` applied first.
+
+Changes:
+
+- `open-sse/utils/cursorModel.js`
+  - Adds `mergeCursorAssistantRawForStreaming()` to treat partial thinking-field text as reasoning until the stream exposes a final/content boundary
+  - Strips synthetic `<think>` prefix when splitting on `<|final|>`
+- `open-sse/executors/cursor.js`
+  - Uses the streaming merger only for SSE deltas; JSON/final behavior remains unchanged
+- `tests/unit/cursor-default.test.js`
+  - Covers tool-call turns with delayed `</think>` so planning text never appears as `content`
+  - Covers final answer streaming from thinking field starting at visible markdown only
+
 ## `0002-arechta-cu-composer-agent-tools.patch`
 
 Adds **agentic / tool-calling support** for `cu/default`, Composer, and `-thinking` Cursor models on OpenAI-compatible `/v1/chat/completions` routes.
