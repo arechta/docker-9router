@@ -120,3 +120,40 @@ Refresh upstream + re-apply:
 ```bash
 bash scripts/sync-repository.sh
 ```
+
+## `0006-arechta-cu-thinking-reasoning.patch`
+
+Fixes **thinking/reasoning leak** for `cu/default` and Composer models: text before `</think>` was merged into visible `content` (0001 promote-all) instead of the expandable **Thought** panel.
+
+Requires `0001` + `0002` + `0003` + `0004` + `0005` applied first.
+
+Changes:
+
+- `open-sse/utils/cursorModel.js`
+  - `splitCursorThinkingSurface()` — split at `</think>` (and `\u003cthink\u003e` alias)
+  - `mergeCursorAssistantRaw()` — merge protobuf text + thinking fields
+  - `getCursorForwardThinkingMode()` — env `CURSOR_FORWARD_THINKING` (default `reasoning_content`)
+  - `shouldPreserveReasoningWithContent()` — keep Thought panel when reasoning ≠ content
+- `open-sse/utils/cursorComposerTools.js`
+  - `resolveCursorAssistantParts()` — route reasoning vs content by mode
+  - `StreamingComposerFilter.getReasoningDelta()` — SSE `delta.reasoning_content`
+  - Strip `redacted_thinking` and `think` control tokens
+- `open-sse/executors/cursor.js` — emit `reasoning_content` (JSON + SSE); fix empty-completion when only reasoning
+- `open-sse/handlers/chatCore/nonStreamingHandler.js`, `sseToJsonHandler.js` — preserve split reasoning alongside content
+- `tests/unit/cursor-default.test.js` — split fixtures (text field + thinking field)
+
+Env (optional):
+
+```bash
+CURSOR_FORWARD_THINKING=reasoning_content   # default — Thought UI via reasoning_content
+# off | content | both | reasoning_content
+# content = legacy 0001 promote-all-to-content
+```
+
+**Deploy:** `repository/` is gitignored — after `git pull` you must run `bash scripts/sync-repository.sh` before `docker compose build`, or the container still runs old code.
+
+Refresh upstream + re-apply:
+
+```bash
+bash scripts/sync-repository.sh
+```

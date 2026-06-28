@@ -1,0 +1,746 @@
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index 0a7d266..84c0bb7 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -10,6 +10,7 @@ import { buildCursorHeaders } from "../utils/cursorChecksum.js";
+ import {
+   normalizeCursorModelId,
+   resolveCursorUpstreamModel,
++  mergeCursorAssistantRaw,
+   shouldPromoteThinkingToContent,
+ } from "../utils/cursorModel.js";
+ import {
+@@ -20,6 +21,7 @@ import {
+ import { estimateUsage } from "../utils/usageTracking.js";
+ import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
+ import { chatChunkSse } from "../utils/sse.js";
++import { reasoningDelta } from "../translator/concerns/reasoning.js";
+ import { FORMATS } from "../translator/formats.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
+ import zlib from "zlib";
+@@ -156,25 +158,42 @@ function createEmptyCompletionError(model) {
+   });
+ }
+ 
+-function buildRawAssistantText(model, totalContent, totalThinking) {
+-  if (totalContent) return totalContent;
+-  if (shouldPromoteThinkingToContent(model)) return totalThinking;
+-  return "";
++function hasAssistantOutput(finalContent, finalReasoning, toolCalls, promoteThinking) {
++  if (toolCalls.length > 0) return true;
++  if (finalContent) return true;
++  return Boolean(finalReasoning) && promoteThinking;
+ }
+ 
+-function emitContentDelta(chunks, { responseId, created, model, deltaContent, toolCallsLength }) {
++function buildRawAssistantText(totalContent, totalThinking) {
++  return mergeCursorAssistantRaw(totalContent, totalThinking);
++}
++
++function emitContentDelta(chunks, { responseId, created, model, deltaContent, toolCallsLength, hasReasoning }) {
+   if (!deltaContent) return;
+   chunks.push(chatChunkSse({
+     id: responseId,
+     created,
+     model,
+     delta:
+-      chunks.length === 0 && toolCallsLength === 0
++      chunks.length === 0 && toolCallsLength === 0 && !hasReasoning
+         ? { role: "assistant", content: deltaContent }
+         : { content: deltaContent }
+   }));
+ }
+ 
++function emitReasoningDelta(chunks, { responseId, created, model, deltaReasoning, toolCallsLength }) {
++  if (!deltaReasoning) return;
++  chunks.push(chatChunkSse({
++    id: responseId,
++    created,
++    model,
++    delta: {
++      ...reasoningDelta(deltaReasoning, chunks.length === 0 && toolCallsLength === 0),
++      reasoning: deltaReasoning,
++    }
++  }));
++}
++
+ function emitTextToolCalls(chunks, toolCalls, { responseId, created, model, startIndex = 0 }) {
+   for (let i = 0; i < toolCalls.length; i += 1) {
+     const tc = toolCalls[i];
+@@ -474,7 +493,7 @@ export class CursorExecutor extends BaseExecutor {
+ 
+     const promoteThinking = shouldPromoteThinkingToContent(model);
+     const clientTools = getClientToolsFromBody(body?.tools);
+-    const { content: finalContent, toolCalls: mergedToolCalls } = finalizeAssistantOutput(
++    const { content: finalContent, reasoningContent: finalReasoning, toolCalls: mergedToolCalls } = finalizeAssistantOutput(
+       totalContent,
+       totalThinking,
+       promoteThinking,
+@@ -489,15 +508,19 @@ export class CursorExecutor extends BaseExecutor {
+     // Finalize protobuf tool calls already handled above; mergedToolCalls includes text-parsed calls
+     debugLog(`[CURSOR BUFFER] Final toolCalls count: ${mergedToolCalls.length}`);
+ 
+-    if (!finalContent && mergedToolCalls.length === 0) {
++    if (!hasAssistantOutput(finalContent, finalReasoning, mergedToolCalls, promoteThinking)) {
+       return createEmptyCompletionError(model);
+     }
+ 
+     const message = {
+       role: "assistant",
+-      content: finalContent || null
++      content: finalContent || null,
+     };
+ 
++    if (finalReasoning && promoteThinking) {
++      message.reasoning_content = finalReasoning;
++    }
++
+     if (mergedToolCalls.length > 0) {
+       message.tool_calls = mergedToolCalls;
+     }
+@@ -662,14 +685,23 @@ export class CursorExecutor extends BaseExecutor {
+       }
+ 
+       if (result.text || result.thinking) {
+-        streamFilter.setRaw(buildRawAssistantText(model, totalContent, totalThinking));
++        streamFilter.setRaw(buildRawAssistantText(totalContent, totalThinking));
++        const deltaReasoning = streamFilter.getReasoningDelta();
++        emitReasoningDelta(chunks, {
++          responseId,
++          created,
++          model,
++          deltaReasoning,
++          toolCallsLength: toolCalls.length,
++        });
+         const deltaContent = streamFilter.getContentDelta();
+         emitContentDelta(chunks, {
+           responseId,
+           created,
+           model,
+           deltaContent,
+-          toolCallsLength: toolCalls.length
++          toolCallsLength: toolCalls.length,
++          hasReasoning: Boolean(deltaReasoning),
+         });
+       }
+     }
+@@ -732,7 +764,7 @@ export class CursorExecutor extends BaseExecutor {
+       }
+     }
+ 
+-    const { content: finalContent, toolCalls: finalToolCalls } = finalizeAssistantOutput(
++    const { content: finalContent, reasoningContent: finalReasoning, toolCalls: finalToolCalls } = finalizeAssistantOutput(
+       totalContent,
+       totalThinking,
+       promoteThinking,
+@@ -741,7 +773,7 @@ export class CursorExecutor extends BaseExecutor {
+     );
+     mergedToolCalls = finalToolCalls;
+ 
+-    if (!finalContent && mergedToolCalls.length === 0) {
++    if (!hasAssistantOutput(finalContent, finalReasoning, mergedToolCalls, promoteThinking)) {
+       return createEmptyCompletionError(model);
+     }
+ 
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index 0053e9b..ab1dd65 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -8,6 +8,7 @@ import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
+ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats } from "./requestDetail.js";
+ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { decloakToolNames } from "../../utils/claudeCloaking.js";
++import { shouldPreserveReasoningWithContent } from "../../utils/cursorModel.js";
+ 
+ /**
+  * Translate non-streaming response body from provider format → OpenAI format.
+@@ -216,7 +217,9 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+   if (translatedResponse?.choices) {
+     for (const choice of translatedResponse.choices) {
+       if (choice?.message?.reasoning_content && choice.message.content) {
+-        delete choice.message.reasoning_content;
++        if (!shouldPreserveReasoningWithContent(choice.message.reasoning_content, choice.message.content)) {
++          delete choice.message.reasoning_content;
++        }
+       }
+     }
+   }
+diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
+index 1e0edeb..45cb54b 100644
+--- a/open-sse/handlers/chatCore/sseToJsonHandler.js
++++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
+@@ -8,6 +8,7 @@ import { buildRequestDetail, extractRequestConfig, saveUsageStats } from "./requ
+ // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
+ const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
+ import { saveRequestDetail, appendRequestLog } from "@/lib/usageDb.js";
++import { shouldPreserveReasoningWithContent } from "../../utils/cursorModel.js";
+ 
+ function textFromResponsesMessageItem(item) {
+   if (!item?.content || !Array.isArray(item.content)) return "";
+@@ -222,7 +223,9 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, pr
+     if (parsed?.choices) {
+       for (const choice of parsed.choices) {
+         if (choice?.message?.reasoning_content && choice.message.content) {
+-          delete choice.message.reasoning_content;
++          if (!shouldPreserveReasoningWithContent(choice.message.reasoning_content, choice.message.content)) {
++            delete choice.message.reasoning_content;
++          }
+         }
+       }
+     }
+diff --git a/open-sse/utils/cursorComposerTools.js b/open-sse/utils/cursorComposerTools.js
+index c33e02b..08eefdc 100644
+--- a/open-sse/utils/cursorComposerTools.js
++++ b/open-sse/utils/cursorComposerTools.js
+@@ -7,7 +7,16 @@
+  * pwnapplehat/cursor-proxy-patched (schema arg fixes), timxx/Cursor-To-OpenAI (Anthropic IDs).
+  */
+ 
+-import { normalizePromotedText } from "./cursorModel.js";
++import {
++  getCursorForwardThinkingMode,
++  hasCursorThinkingMarkers,
++  isCursorPlanningText,
++  mergeCursorAssistantRaw,
++  normalizePromotedText,
++  REDACTED_THINKING_BEGIN,
++  REDACTED_THINKING_END,
++  splitCursorThinkingSurface,
++} from "./cursorModel.js";
+ 
+ const TOOL_CALLS_BEGIN = "<|tool_calls_begin|>";
+ const TOOL_CALLS_END = "<|tool_calls_end|>";
+@@ -453,6 +462,11 @@ export function normalizeOpenAIToolCalls(toolCalls, clientTools = []) {
+ export function stripCursorControlTokens(text) {
+   let out = prepareComposerWireText(text);
+ 
++  out = out.replaceAll(REDACTED_THINKING_BEGIN, "");
++  out = out.replaceAll(REDACTED_THINKING_END, "");
++  out = out.replaceAll("\u003cthink\u003e", "");
++  out = out.replaceAll("\u003c/think\u003e", "");
++
+   out = out.replace(TOOL_CALLS_ENVELOPE_RE, "");
+   out = out.replace(TOOL_MARKER_RE, "");
+   out = out.replace(TOOL_CALL_BLOCK_RE, "");
+@@ -743,47 +757,84 @@ export function toOpenAIToolCall(parsed, clientTools = []) {
+   };
+ }
+ 
++/**
++ * Resolve reasoning vs visible content according to CURSOR_FORWARD_THINKING.
++ * @param {string} raw
++ * @param {boolean} promoteThinking
++ * @returns {{ reasoning: string, content: string }}
++ */
++export function resolveCursorAssistantParts(raw, promoteThinking = false) {
++  const mode = getCursorForwardThinkingMode();
++  const split = splitCursorThinkingSurface(raw);
++  let { reasoning, content } = split;
++
++  if (reasoning) {
++    reasoning = reasoning.replaceAll(REDACTED_THINKING_BEGIN, "").replaceAll(REDACTED_THINKING_END, "").trim();
++  }
++  content = stripCursorControlTokens(content);
++
++  if (content && (hasCursorThinkingMarkers(content) || (!reasoning && isCursorPlanningText(content)))) {
++    const resplit = splitCursorThinkingSurface(content);
++    if (resplit.reasoning) {
++      reasoning = reasoning ? `${reasoning}\n${resplit.reasoning}`.trim() : resplit.reasoning;
++    }
++    content = resplit.content;
++    content = stripCursorControlTokens(content);
++  }
++
++  if (mode === "off") {
++    reasoning = "";
++  } else if (mode === "content" && promoteThinking) {
++    if (!content && reasoning) content = reasoning;
++    reasoning = "";
++  }
++
++  return { reasoning, content: content || "" };
++}
++
+ /**
+  * @param {string} raw
+  * @param {Array<{ name: string, parameters?: Record<string, unknown> }>} [clientTools]
++ * @param {boolean} [promoteThinking]
+  */
+-export function processComposerAssistantText(raw, clientTools = []) {
++export function processComposerAssistantText(raw, clientTools = [], promoteThinking = false) {
+   if (!raw) {
+-    return { content: null, toolCalls: [] };
++    return { content: null, reasoningContent: null, toolCalls: [] };
+   }
+ 
+   const sanitized = sanitizeForParsing(raw);
+   const prepared = prepareComposerWireText(sanitized);
+-  const promoted = normalizePromotedText(prepared);
+-  const text = promoted || prepared;
++  const { reasoning, content: visibleContent } = resolveCursorAssistantParts(prepared, promoteThinking);
++  const text = visibleContent || "";
++  const textForTools = prepared;
+   const toolCalls = [];
+   const consumedRanges = [];
+ 
+   TOOL_CALL_BLOCK_RE.lastIndex = 0;
+-  let match = TOOL_CALL_BLOCK_RE.exec(text);
++  let match = TOOL_CALL_BLOCK_RE.exec(textForTools);
+   while (match) {
+     const parsed = parseComposerToolCallBlock(match[1]);
+     if (parsed) toolCalls.push(parsed);
+     consumedRanges.push([match.index, match.index + match[0].length]);
+-    match = TOOL_CALL_BLOCK_RE.exec(text);
++    match = TOOL_CALL_BLOCK_RE.exec(textForTools);
+   }
+ 
+   if (toolCalls.length === 0) {
+-    const strictCalls = parseStrictMarkerEnvelope(text);
++    const strictCalls = parseStrictMarkerEnvelope(textForTools);
+     if (strictCalls.length > 0) {
+       toolCalls.push(...strictCalls);
+       TOOL_CALLS_ENVELOPE_RE.lastIndex = 0;
+-      let envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++      let envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(textForTools);
+       while (envelopeMatch) {
+         consumedRanges.push([envelopeMatch.index, envelopeMatch.index + envelopeMatch[0].length]);
+-        envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++        envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(textForTools);
+       }
+     }
+   }
+ 
+   if (toolCalls.length === 0) {
+     TOOL_CALLS_ENVELOPE_RE.lastIndex = 0;
+-    let envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++    let envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(textForTools);
+     while (envelopeMatch) {
+       const innerCalls = parseLenientEnvelopeInner(envelopeMatch[1]);
+       toolCalls.push(...innerCalls);
+@@ -791,12 +842,12 @@ export function processComposerAssistantText(raw, clientTools = []) {
+         envelopeMatch.index,
+         envelopeMatch.index + envelopeMatch[0].length,
+       ]);
+-      envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++      envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(textForTools);
+     }
+   }
+ 
+   if (toolCalls.length === 0) {
+-    const anthropicCalls = parseToolCallsFromAnthropicIds(text);
++    const anthropicCalls = parseToolCallsFromAnthropicIds(textForTools);
+     toolCalls.push(...anthropicCalls);
+   }
+ 
+@@ -809,6 +860,7 @@ export function processComposerAssistantText(raw, clientTools = []) {
+ 
+   return {
+     content: content || null,
++    reasoningContent: reasoning || null,
+     toolCalls: toolCalls.map((parsed) => toOpenAIToolCall(parsed, clientTools)),
+   };
+ }
+@@ -827,20 +879,31 @@ export function finalizeAssistantOutput(
+   protobufToolCalls,
+   clientTools = [],
+ ) {
+-  const rawText = totalContent || (promoteThinking ? totalThinking : "") || "";
++  const rawText = mergeCursorAssistantRaw(totalContent, totalThinking);
+ 
+-  const { content, toolCalls: textToolCalls } = processComposerAssistantText(rawText, clientTools);
++  const { content, reasoningContent, toolCalls: textToolCalls } = processComposerAssistantText(
++    rawText,
++    clientTools,
++    promoteThinking,
++  );
+   let toolCalls = protobufToolCalls.length > 0 ? protobufToolCalls : textToolCalls;
+   toolCalls = normalizeOpenAIToolCalls(toolCalls, clientTools);
+ 
+   let finalContent = content;
++  let finalReasoning = reasoningContent;
++
+   if (!finalContent && protobufToolCalls.length > 0) {
+     finalContent = null;
+   } else if (!finalContent && totalContent) {
+-    finalContent = stripCursorControlTokens(totalContent) || null;
++    const fallback = resolveCursorAssistantParts(
++      stripCursorControlTokens(totalContent),
++      promoteThinking,
++    );
++    finalContent = fallback.content || null;
++    finalReasoning = finalReasoning || fallback.reasoning || null;
+   }
+ 
+-  return { content: finalContent, toolCalls };
++  return { content: finalContent, reasoningContent: finalReasoning, toolCalls };
+ }
+ 
+ /**
+@@ -851,6 +914,7 @@ export class StreamingComposerFilter {
+   constructor(promoteThinking = false, clientTools = []) {
+     this.rawBuffer = "";
+     this.emittedContentLength = 0;
++    this.emittedReasoningLength = 0;
+     this.promoteThinking = promoteThinking;
+     this.clientTools = clientTools;
+   }
+@@ -868,19 +932,29 @@ export class StreamingComposerFilter {
+ 
+   /** @returns {string} */
+   getContentDelta() {
+-    if (this.promoteThinking && !hasComposerWireMarkers(this.rawBuffer)) {
+-      return "";
+-    }
+-
+     const safeRaw = this.getSafeRawForContent();
+-    const { content } = processComposerAssistantText(safeRaw, this.clientTools);
++    const { content } = processComposerAssistantText(safeRaw, this.clientTools, this.promoteThinking);
+     const safe = content || "";
+     const delta = safe.slice(this.emittedContentLength);
+     this.emittedContentLength = safe.length;
+     return delta;
+   }
+ 
++  /** @returns {string} */
++  getReasoningDelta() {
++    const safeRaw = this.getSafeRawForContent();
++    const { reasoningContent } = processComposerAssistantText(
++      safeRaw,
++      this.clientTools,
++      this.promoteThinking,
++    );
++    const safe = reasoningContent || "";
++    const delta = safe.slice(this.emittedReasoningLength);
++    this.emittedReasoningLength = safe.length;
++    return delta;
++  }
++
+   getTextToolCalls() {
+-    return processComposerAssistantText(this.rawBuffer, this.clientTools).toolCalls;
++    return processComposerAssistantText(this.rawBuffer, this.clientTools, this.promoteThinking).toolCalls;
+   }
+ }
+diff --git a/open-sse/utils/cursorModel.js b/open-sse/utils/cursorModel.js
+index 2ed3783..7910951 100644
+--- a/open-sse/utils/cursorModel.js
++++ b/open-sse/utils/cursorModel.js
+@@ -3,9 +3,35 @@
+  * Patched for cu/default empty responses (decolua#1077, jahrulnr/9router#1).
+  */
+ 
+-const REDACTED_THINKING_END = "</think>";
++export const REDACTED_THINKING_BEGIN = "<think>";
++export const REDACTED_THINKING_END = "</think>";
++const THINK_BEGIN = "\u003cthink\u003e";
++const THINK_END = "\u003c/think\u003e";
+ const FINAL_TAG = "<|final|>";
+ 
++const THINKING_END_MARKERS = [REDACTED_THINKING_END, THINK_END];
++const THINKING_BEGIN_MARKERS = [REDACTED_THINKING_BEGIN, THINK_BEGIN];
++/** Corrupted stream endings e.g. `</th@module/document` when tag merges with path. */
++const FUZZY_THINKING_END_RE = /<\/(?:redacted_)?think(?:ing)?(?=>|[^a-zA-Z]|$)/gi;
++const PLANNING_PREFIX_RE = /(?:^|\n)\s*(?:The user (?:wants|asked)|User asked|I'll (?:use|read|give|summarize))/i;
++const ANSWER_START_RE = /\n\s*(?:\*\*[^*\n]+?\*\*|#{1,3}\s|\|[\s-]*(?:Area|Key|Field)\s*\|)/;
++
++/** @typedef {"off" | "reasoning_content" | "content" | "both"} CursorForwardThinkingMode */
++
++/**
++ * How to surface Cursor thinking blocks to OpenAI-compatible clients.
++ * - off: strip thinking from visible content only
++ * - reasoning_content (default): delta/message.reasoning_content for Thought UI
++ * - content: legacy 0001 promote-all-to-content (may leak without closing tag)
++ * - both: reasoning_content + visible answer after </think>
++ * @returns {CursorForwardThinkingMode}
++ */
++export function getCursorForwardThinkingMode() {
++  const mode = String(process.env.CURSOR_FORWARD_THINKING || "reasoning_content").toLowerCase();
++  if (mode === "off" || mode === "content" || mode === "both") return mode;
++  return "reasoning_content";
++}
++
+ const LEGACY_MODEL_MAP = {
+   "claude-3-5-sonnet": "claude-4.5-sonnet",
+   "claude-3-5-sonnet-20241022": "claude-4.5-sonnet",
+@@ -16,29 +42,166 @@ const LEGACY_MODEL_MAP = {
+ };
+ 
+ /**
+- * Extract user-visible assistant text from thinking / promoted content.
+- * @param {string} thinking
++ * Whether raw assistant text includes Cursor thinking surface markers.
++ * @param {string} raw
++ * @returns {boolean}
++ */
++export function hasCursorThinkingMarkers(raw) {
++  if (!raw) return false;
++  return (
++    THINKING_END_MARKERS.some((marker) => raw.includes(marker))
++    || THINKING_BEGIN_MARKERS.some((marker) => raw.includes(marker))
++    || /redacted_thinking/i.test(raw)
++    || raw.includes(THINK_BEGIN)
++    || raw.includes(THINK_END)
++  );
++}
++
++function findLastThinkingEnd(raw) {
++  let bestIdx = -1;
++  let bestLength = 0;
++
++  for (const marker of THINKING_END_MARKERS) {
++    const idx = raw.lastIndexOf(marker);
++    if (idx > bestIdx || (idx === bestIdx && marker.length > bestLength)) {
++      bestIdx = idx;
++      bestLength = marker.length;
++    }
++  }
++
++  if (bestIdx < 0) {
++    FUZZY_THINKING_END_RE.lastIndex = 0;
++    let fuzzyMatch = FUZZY_THINKING_END_RE.exec(raw);
++    while (fuzzyMatch) {
++      const idx = fuzzyMatch.index;
++      const len = fuzzyMatch[0].length;
++      if (idx > bestIdx || (idx === bestIdx && len > bestLength)) {
++        bestIdx = idx;
++        bestLength = len;
++      }
++      fuzzyMatch = FUZZY_THINKING_END_RE.exec(raw);
++    }
++  }
++
++  return bestIdx >= 0 ? { index: bestIdx, length: bestLength } : null;
++}
++
++function stripThinkingBegin(raw) {
++  let out = raw;
++  for (const marker of THINKING_BEGIN_MARKERS) {
++    if (out.startsWith(marker)) {
++      out = out.slice(marker.length).trimStart();
++    }
++  }
++  return out;
++}
++
++/**
++ * Merge protobuf text + thinking fields (Cursor sometimes puts full stream in text).
++ * @param {string} totalContent
++ * @param {string} totalThinking
+  * @returns {string}
+  */
+-export function normalizePromotedText(thinking) {
+-  if (!thinking) return "";
++export function mergeCursorAssistantRaw(totalContent, totalThinking) {
++  const content = totalContent || "";
++  const thinking = totalThinking || "";
++  if (!content) return thinking;
++  if (!thinking) return content;
++  if (hasCursorThinkingMarkers(content)) return content;
++  if (hasCursorThinkingMarkers(thinking)) {
++    return thinking.includes(REDACTED_THINKING_END)
++      ? `${thinking}${content}`
++      : `${thinking}${content}`;
++  }
++  return `${thinking}${content}`;
++}
+ 
+-  const endIdx = thinking.lastIndexOf(REDACTED_THINKING_END);
+-  if (endIdx >= 0) {
+-    let text = thinking.slice(endIdx + REDACTED_THINKING_END.length);
+-    const finalIdx = text.indexOf(FINAL_TAG);
++function splitCursorHeuristicFallback(raw) {
++  const finalIdx = raw.indexOf(FINAL_TAG);
++  if (finalIdx >= 0) {
++    return {
++      reasoning: raw.slice(0, finalIdx).trim(),
++      content: raw.slice(finalIdx + FINAL_TAG.length).trimStart(),
++    };
++  }
++
++  const answerMatch = raw.match(ANSWER_START_RE);
++  if (answerMatch && answerMatch.index > 40 && PLANNING_PREFIX_RE.test(raw.slice(0, answerMatch.index))) {
++    return {
++      reasoning: raw.slice(0, answerMatch.index).trim(),
++      content: raw.slice(answerMatch.index).trimStart(),
++    };
++  }
++
++  return null;
++}
++
++/**
++ * Split Cursor thinking surface into reasoning vs user-visible answer.
++ * Text before `</think>` → reasoning (Thought panel).
++ * Text after → content.
++ * @param {string} raw
++ * @returns {{ reasoning: string, content: string }}
++ */
++export function splitCursorThinkingSurface(raw) {
++  if (!raw) return { reasoning: "", content: "" };
++
++  const thinkingEnd = findLastThinkingEnd(raw);
++  if (thinkingEnd) {
++    let reasoning = raw.slice(0, thinkingEnd.index).trim();
++    let content = raw.slice(thinkingEnd.index + thinkingEnd.length);
++    reasoning = stripThinkingBegin(reasoning);
++    const finalIdx = content.indexOf(FINAL_TAG);
+     if (finalIdx >= 0) {
+-      text = text.slice(finalIdx + FINAL_TAG.length);
++      content = content.slice(finalIdx + FINAL_TAG.length);
+     }
+-    return text.trimStart();
++    return { reasoning, content: content.trimStart() };
+   }
+ 
+-  const finalIdx = thinking.indexOf(FINAL_TAG);
+-  if (finalIdx >= 0) {
+-    return thinking.slice(finalIdx + FINAL_TAG.length).trimStart();
++  const heuristic = splitCursorHeuristicFallback(raw);
++  if (heuristic) return heuristic;
++
++  if (hasCursorThinkingMarkers(raw)) {
++    let reasoning = stripThinkingBegin(raw);
++    return { reasoning: reasoning.trim(), content: "" };
++  }
++
++  if (PLANNING_PREFIX_RE.test(raw)) {
++    return { reasoning: raw.trim(), content: "" };
+   }
+ 
+-  return "";
++  return { reasoning: "", content: raw };
++}
++
++/**
++ * Whether text looks like Cursor internal planning (no answer yet).
++ * @param {string} text
++ * @returns {boolean}
++ */
++export function isCursorPlanningText(text) {
++  const t = String(text || "").trim();
++  if (!t) return false;
++  if (hasCursorThinkingMarkers(t)) return true;
++  return PLANNING_PREFIX_RE.test(t) && !ANSWER_START_RE.test(t);
++}
++
++export function normalizePromotedText(thinking) {
++  return splitCursorThinkingSurface(thinking).content;
++}
++
++/**
++ * Whether reasoning_content should stay alongside non-empty content (Cursor split).
++ * Generic providers often duplicate thinking in content — strip those.
++ * @param {string} reasoning
++ * @param {string} content
++ * @returns {boolean}
++ */
++export function shouldPreserveReasoningWithContent(reasoning, content) {
++  const r = String(reasoning || "").trim();
++  const c = String(content || "").trim();
++  if (!r || !c) return false;
++  if (c.includes("redacted_thinking") || r.includes("redacted_thinking")) return false;
++  return !c.includes(r) && !r.includes(c);
+ }
+ 
+ /**
+diff --git a/tests/unit/cursor-default.test.js b/tests/unit/cursor-default.test.js
+index 22e2dc7..1d8a588 100644
+--- a/tests/unit/cursor-default.test.js
++++ b/tests/unit/cursor-default.test.js
+@@ -6,7 +6,9 @@ import {
+   normalizeCursorModelId,
+   resolveCursorUpstreamModel,
+   shouldPromoteThinkingToContent,
++  splitCursorThinkingSurface,
+ } from "../../open-sse/utils/cursorModel.js";
++import { processComposerAssistantText } from "../../open-sse/utils/cursorComposerTools.js";
+ 
+ const LEN = 2;
+ 
+@@ -28,6 +30,21 @@ function cursorResponseFrame({ text = "", thinking = "" }) {
+ }
+ 
+ describe("cursorModel helpers", () => {
++  it("splits reasoning before </think>", () => {
++    const raw = "planning step</think>Visible answer";
++    expect(splitCursorThinkingSurface(raw)).toEqual({
++      reasoning: "planning step",
++      content: "Visible answer",
++    });
++  });
++
++  it("splits on corrupted thinking end tag merged with path", () => {
++    const raw = "The user wants me to read package.json</th@module/document\n\n**5.0.0** — NestJS";
++    const split = splitCursorThinkingSurface(raw);
++    expect(split.reasoning).toContain("read package.json");
++    expect(split.content).toContain("**5.0.0**");
++    expect(split.content).not.toContain("The user wants");
++  });
+   it("normalizes legacy Claude model ids", () => {
+     expect(normalizeCursorModelId("cu/claude-3-5-sonnet-20240620")).toBe("claude-4.5-sonnet");
+   });
+@@ -51,16 +68,34 @@ describe("CursorExecutor default model responses", () => {
+       thinking: "internal plan</think>Hello!",
+     });
+ 
+-    const response = executor.transformProtobufToJSON(buffer, "cu/default", {
++    const response = await executor.transformProtobufToJSON(buffer, "cu/default", {
+       messages: [{ role: "user", content: "hi" }],
+     });
+     const payload = await response.json();
+ 
+     expect(response.status).toBe(200);
+     expect(payload.choices[0].message.content).toBe("Hello!");
++    expect(payload.choices[0].message.reasoning_content).toBe("internal plan");
++    expect(JSON.stringify(payload)).not.toContain("redacted_thinking");
+     expect(payload.usage.completion_tokens).toBeGreaterThan(0);
+   });
+ 
++  it("splits thinking from answer when full stream arrives in text field", () => {
++    const raw = [
++      "User asked to read the arechta-backend-nest skill.",
++      "I've read SKILL.md, nestjs-coding, workspace, toolchain.",
++      "Caveman mode.",
++      "</think>Loaded** /skills/arechta-backend-nest/",
++    ].join("\n");
++
++    const result = processComposerAssistantText(raw, [], true);
++
++    expect(result.reasoningContent).toContain("arechta-backend-nest skill");
++    expect(result.content).toContain("Loaded**");
++    expect(result.content).not.toContain("Caveman mode");
++    expect(JSON.stringify(result)).not.toContain("redacted_thinking");
++  });
++
+   it("strips <|final|> prefix for default model without redacted_thinking wrapper", async () => {
+     const executor = new CursorExecutor();
+     const buffer = cursorResponseFrame({
+@@ -105,7 +140,7 @@ describe("CursorExecutor default model responses", () => {
+   it("returns error for thinking-only on non-promoted models", async () => {
+     const executor = new CursorExecutor();
+     const buffer = cursorResponseFrame({
+-      thinking: "private</think>hidden",
++      thinking: "<think>private reasoning without answer tag",
+     });
+ 
+     const response = executor.transformProtobufToJSON(buffer, "gpt-5.3-codex", {
+@@ -116,4 +151,20 @@ describe("CursorExecutor default model responses", () => {
+     expect(response.status).toBe(502);
+     expect(payload.error?.code).toBe("empty_completion");
+   });
++
++  it("extracts post-thinking answer for non-promoted models when closing tag present", async () => {
++    const executor = new CursorExecutor();
++    const buffer = cursorResponseFrame({
++      thinking: "private</think>hidden",
++    });
++
++    const response = await executor.transformProtobufToJSON(buffer, "gpt-5.3-codex", {
++      messages: [{ role: "user", content: "hi" }],
++    });
++    const payload = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(payload.choices[0].message.content).toBe("hidden");
++    expect(payload.choices[0].message.reasoning_content).toBeUndefined();
++  });
+ });
