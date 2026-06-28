@@ -1,0 +1,724 @@
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index bb8b6d8..4ba5a30 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -11,8 +11,11 @@ import {
+   normalizeCursorModelId,
+   resolveCursorUpstreamModel,
+   shouldPromoteThinkingToContent,
+-  visibleContentFromThinking
+ } from "../utils/cursorModel.js";
++import {
++  finalizeAssistantOutput,
++  StreamingComposerFilter
++} from "../utils/cursorComposerTools.js";
+ import { estimateUsage } from "../utils/usageTracking.js";
+ import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
+ import { chatChunkSse } from "../utils/sse.js";
+@@ -152,9 +155,48 @@ function createEmptyCompletionError(model) {
+   });
+ }
+ 
+-function visibleThinkingContent(model, totalThinking) {
+-  if (!shouldPromoteThinkingToContent(model)) return "";
+-  return visibleContentFromThinking(totalThinking);
++function buildRawAssistantText(model, totalContent, totalThinking) {
++  if (totalContent) return totalContent;
++  if (shouldPromoteThinkingToContent(model)) return totalThinking;
++  return "";
++}
++
++function emitContentDelta(chunks, { responseId, created, model, deltaContent, toolCallsLength }) {
++  if (!deltaContent) return;
++  chunks.push(chatChunkSse({
++    id: responseId,
++    created,
++    model,
++    delta:
++      chunks.length === 0 && toolCallsLength === 0
++        ? { role: "assistant", content: deltaContent }
++        : { content: deltaContent }
++  }));
++}
++
++function emitTextToolCalls(chunks, toolCalls, { responseId, created, model, startIndex = 0 }) {
++  for (let i = 0; i < toolCalls.length; i += 1) {
++    const tc = toolCalls[i];
++    const index = startIndex + i;
++    chunks.push(chatChunkSse({
++      id: responseId,
++      created,
++      model,
++      delta: {
++        tool_calls: [
++          {
++            index,
++            id: tc.id,
++            type: "function",
++            function: {
++              name: tc.function.name,
++              arguments: tc.function.arguments
++            }
++          }
++        ]
++      }
++    }));
++  }
+ }
+ 
+ export class CursorExecutor extends BaseExecutor {
+@@ -195,7 +237,8 @@ export class CursorExecutor extends BaseExecutor {
+       || ua.includes("claude-code")
+       || ua.includes("Claude Code")
+       || modelId === "default"
+-      || modelId === "auto";
++      || modelId === "auto"
++      || (Array.isArray(tools) && tools.length > 0);
+     return generateCursorBody(messages, upstreamModel, tools, reasoningEffort, forceAgentMode);
+   }
+ 
+@@ -414,16 +457,7 @@ export class CursorExecutor extends BaseExecutor {
+       if (result.thinking) totalThinking += result.thinking;
+     }
+ 
+-    const visibleThinking = visibleThinkingContent(model, totalThinking);
+-    const finalContent = totalContent || visibleThinking;
+-
+-    debugLog(
+-      `[CURSOR BUFFER] Parsed ${frameCount} frames, toolCallsMap size: ${toolCallsMap.size}, finalized toolCalls: ${toolCalls.length}`
+-    );
+-
+-    // Finalize all remaining tool calls in map (in case stream ended without isLast=true)
+     for (const [id, tc] of toolCallsMap.entries()) {
+-      // Check if already in final array
+       if (!finalizedIds.has(id)) {
+         debugLog(`[CURSOR BUFFER] Finalizing incomplete tool call: ${id}, isLast=${tc.isLast}`);
+         toolCalls.push({
+@@ -437,9 +471,22 @@ export class CursorExecutor extends BaseExecutor {
+       }
+     }
+ 
+-    debugLog(`[CURSOR BUFFER] Final toolCalls count: ${toolCalls.length}`);
++    const promoteThinking = shouldPromoteThinkingToContent(model);
++    const { content: finalContent, toolCalls: mergedToolCalls } = finalizeAssistantOutput(
++      totalContent,
++      totalThinking,
++      promoteThinking,
++      toolCalls
++    );
+ 
+-    if (!finalContent && toolCalls.length === 0) {
++    debugLog(
++      `[CURSOR BUFFER] Parsed ${frameCount} frames, toolCallsMap size: ${toolCallsMap.size}, protobuf toolCalls: ${toolCalls.length}, text toolCalls: ${mergedToolCalls.length - toolCalls.length}`
++    );
++
++    // Finalize protobuf tool calls already handled above; mergedToolCalls includes text-parsed calls
++    debugLog(`[CURSOR BUFFER] Final toolCalls count: ${mergedToolCalls.length}`);
++
++    if (!finalContent && mergedToolCalls.length === 0) {
+       return createEmptyCompletionError(model);
+     }
+ 
+@@ -448,11 +495,11 @@ export class CursorExecutor extends BaseExecutor {
+       content: finalContent || null
+     };
+ 
+-    if (toolCalls.length > 0) {
+-      message.tool_calls = toolCalls;
++    if (mergedToolCalls.length > 0) {
++      message.tool_calls = mergedToolCalls;
+     }
+ 
+-    const usage = estimateUsage(body, finalContent.length, FORMATS.OPENAI);
++    const usage = estimateUsage(body, (finalContent || "").length, FORMATS.OPENAI);
+ 
+     const completion = {
+       id: responseId,
+@@ -462,7 +509,7 @@ export class CursorExecutor extends BaseExecutor {
+       choices: [{
+         index: 0,
+         message,
+-        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop"
++        finish_reason: mergedToolCalls.length > 0 ? "tool_calls" : "stop"
+       }],
+       usage
+     };
+@@ -481,7 +528,8 @@ export class CursorExecutor extends BaseExecutor {
+     let offset = 0;
+     let totalContent = "";
+     let totalThinking = "";
+-    let emittedComposerThinkingContentLength = 0;
++    const promoteThinking = shouldPromoteThinkingToContent(model);
++    const streamFilter = new StreamingComposerFilter(promoteThinking);
+     const toolCalls = [];
+     const toolCallsMap = new Map(); // Track streaming tool calls by ID
+     const finalizedIds = new Set();
+@@ -603,30 +651,22 @@ export class CursorExecutor extends BaseExecutor {
+ 
+       if (result.text) {
+         totalContent += result.text;
+-        chunks.push(chatChunkSse({
+-          id: responseId, created, model,
+-          delta:
+-            chunks.length === 0 && toolCalls.length === 0
+-              ? { role: "assistant", content: result.text }
+-              : { content: result.text }
+-        }));
+       }
+ 
+-      if (shouldPromoteThinkingToContent(model) && result.thinking) {
++      if (result.thinking) {
+         totalThinking += result.thinking;
+-        const visibleContent = visibleContentFromThinking(totalThinking);
+-        if (visibleContent.length > emittedComposerThinkingContentLength) {
+-          const deltaContent = visibleContent.slice(emittedComposerThinkingContentLength);
+-          emittedComposerThinkingContentLength = visibleContent.length;
+-          totalContent += deltaContent;
+-          chunks.push(chatChunkSse({
+-            id: responseId, created, model,
+-            delta:
+-              chunks.length === 0 && toolCalls.length === 0
+-                ? { role: "assistant", content: deltaContent }
+-                : { content: deltaContent }
+-          }));
+-        }
++      }
++
++      if (result.text || result.thinking) {
++        streamFilter.setRaw(buildRawAssistantText(model, totalContent, totalThinking));
++        const deltaContent = streamFilter.getContentDelta();
++        emitContentDelta(chunks, {
++          responseId,
++          created,
++          model,
++          deltaContent,
++          toolCallsLength: toolCalls.length
++        });
+       }
+     }
+ 
+@@ -671,15 +711,40 @@ export class CursorExecutor extends BaseExecutor {
+       }
+     }
+ 
+-    if (!totalContent && toolCalls.length === 0) {
++    let mergedToolCalls = toolCalls;
++    if (toolCalls.length === 0) {
++      const textToolCalls = streamFilter.getTextToolCalls();
++      if (textToolCalls.length > 0) {
++        if (chunks.length === 0) {
++          chunks.push(chatChunkSse({ id: responseId, created, model, delta: { role: "assistant", content: "" } }));
++        }
++        emitTextToolCalls(chunks, textToolCalls, {
++          responseId,
++          created,
++          model,
++          startIndex: 0
++        });
++        mergedToolCalls = textToolCalls;
++      }
++    }
++
++    const { content: finalContent, toolCalls: finalToolCalls } = finalizeAssistantOutput(
++      totalContent,
++      totalThinking,
++      promoteThinking,
++      mergedToolCalls
++    );
++    mergedToolCalls = finalToolCalls;
++
++    if (!finalContent && mergedToolCalls.length === 0) {
+       return createEmptyCompletionError(model);
+     }
+ 
+-    if (chunks.length === 0 && toolCalls.length === 0) {
++    if (chunks.length === 0 && mergedToolCalls.length === 0) {
+       chunks.push(chatChunkSse({ id: responseId, created, model, delta: { role: "assistant", content: "" } }));
+     }
+ 
+-    const usage = estimateUsage(body, totalContent.length, FORMATS.OPENAI);
++    const usage = estimateUsage(body, (finalContent || "").length, FORMATS.OPENAI);
+ 
+     chunks.push(
+       `data: ${JSON.stringify({
+@@ -691,7 +756,7 @@ export class CursorExecutor extends BaseExecutor {
+           {
+             index: 0,
+             delta: {},
+-            finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop"
++            finish_reason: mergedToolCalls.length > 0 ? "tool_calls" : "stop"
+           }
+         ],
+         usage
+diff --git a/open-sse/utils/cursorComposerTools.js b/open-sse/utils/cursorComposerTools.js
+new file mode 100644
+index 0000000..8f90863
+--- /dev/null
++++ b/open-sse/utils/cursorComposerTools.js
+@@ -0,0 +1,239 @@
++/**
++ * Parse Composer / Cursor Auto control tokens embedded in assistant text.
++ * cu/default and Composer models often emit Kimi-style tool markers in thinking
++ * instead of protobuf TOOL_CALL frames.
++ */
++
++import { normalizePromotedText } from "./cursorModel.js";
++
++const TOOL_CALLS_BEGIN = "<|tool_calls_begin|>";
++const TOOL_CALLS_END = "<|tool_calls_end|>";
++const TOOL_SEP = "<|tool_sep|>";
++
++const TOOL_CALL_BLOCK_RE =
++  /<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>([\s\S]*?)<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi;
++
++const OUTER_CONTROL_TOKENS = [
++  TOOL_CALLS_BEGIN,
++  TOOL_CALLS_END,
++  "<|final|>",
++  "<|tool_call_begin|>",
++  "<|tool_call_end|>",
++  "<｜tool▁call▁begin｜>",
++  "<｜tool▁call▁end｜>",
++];
++
++let toolCallIdCounter = 0;
++
++function nextToolCallId() {
++  toolCallIdCounter += 1;
++  return `call_cursor_${Date.now()}_${toolCallIdCounter}`;
++}
++
++/**
++ * Extract user-visible assistant text from thinking / promoted content.
++ * @deprecated import from cursorModel.js
++ */
++export { normalizePromotedText } from "./cursorModel.js";
++
++/**
++ * Remove known Cursor control tokens from text.
++ * @param {string} text
++ * @returns {string}
++ */
++export function stripCursorControlTokens(text) {
++  let out = text;
++  for (const token of OUTER_CONTROL_TOKENS) {
++    out = out.split(token).join("");
++  }
++  out = out.replace(/<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>/gi, "");
++  out = out.replace(/<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi, "");
++  return out;
++}
++
++/**
++ * Parse key=value segments after tool name (Glob-style multi-arg).
++ * @param {string[]} segments
++ * @returns {Record<string, unknown>}
++ */
++function parseToolArguments(segments) {
++  const args = {};
++
++  for (const segment of segments) {
++    const trimmed = segment.trim();
++    if (!trimmed) continue;
++
++    if (trimmed.startsWith("{")) {
++      try {
++        const parsed = JSON.parse(trimmed);
++        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
++          Object.assign(args, parsed);
++          continue;
++        }
++      } catch {
++        // fall through to key=value parsing
++      }
++    }
++
++    const spaceIdx = trimmed.indexOf(" ");
++    if (spaceIdx > 0) {
++      const key = trimmed.slice(0, spaceIdx).trim();
++      const value = trimmed.slice(spaceIdx + 1).trim();
++      if (key) args[key] = value;
++    } else if (!Object.keys(args).length) {
++      args.input = trimmed;
++    }
++  }
++
++  return args;
++}
++
++/**
++ * Parse one Composer tool-call block inner payload.
++ * @param {string} inner
++ * @returns {{ name: string, args: Record<string, unknown> } | null}
++ */
++export function parseComposerToolCallBlock(inner) {
++  if (!inner?.trim()) return null;
++
++  const parts = inner.split(TOOL_SEP).map((part) => part.trim()).filter(Boolean);
++  if (parts.length === 0) return null;
++
++  let name = parts[0];
++  let argParts = parts.slice(1);
++
++  if (name === "function" && parts.length > 1) {
++    name = parts[1];
++    argParts = parts.slice(2);
++  }
++
++  name = name.trim();
++  if (!name) return null;
++
++  return {
++    name,
++    args: parseToolArguments(argParts),
++  };
++}
++
++/**
++ * Convert parsed tool call to OpenAI chat.completion tool_calls entry.
++ * @param {{ name: string, args: Record<string, unknown> }} parsed
++ * @param {number} index
++ * @returns {{ id: string, type: "function", function: { name: string, arguments: string } }}
++ */
++export function toOpenAIToolCall(parsed) {
++  return {
++    id: nextToolCallId(),
++    type: "function",
++    function: {
++      name: parsed.name,
++      arguments: JSON.stringify(parsed.args ?? {}),
++    },
++  };
++}
++
++function shouldNormalizePromotedRaw(raw) {
++  return raw.includes("</think>")
++    || raw.includes("<|final|>")
++    || raw.includes(TOOL_CALLS_BEGIN);
++}
++
++/**
++ * Strip Composer tool markers and parse embedded tool calls from assistant text.
++ * @param {string} raw
++ * @returns {{ content: string | null, toolCalls: ReturnType<typeof toOpenAIToolCall>[] }}
++ */
++export function processComposerAssistantText(raw) {
++  if (!raw) {
++    return { content: null, toolCalls: [] };
++  }
++
++  let text = shouldNormalizePromotedRaw(raw) ? normalizePromotedText(raw) : raw;
++  const toolCalls = [];
++  const blocks = [];
++
++  TOOL_CALL_BLOCK_RE.lastIndex = 0;
++  let match = TOOL_CALL_BLOCK_RE.exec(text);
++  while (match) {
++    blocks.push({ full: match[0], inner: match[1], start: match.index });
++    match = TOOL_CALL_BLOCK_RE.exec(text);
++  }
++
++  let content = text;
++  for (let i = blocks.length - 1; i >= 0; i -= 1) {
++    const block = blocks[i];
++    const parsed = parseComposerToolCallBlock(block.inner);
++    if (parsed) {
++      toolCalls.unshift(parsed);
++    }
++    content = content.slice(0, block.start) + content.slice(block.start + block.full.length);
++  }
++
++  content = stripCursorControlTokens(content).trim();
++
++  return {
++    content: content || null,
++    toolCalls: toolCalls.map((parsed) => toOpenAIToolCall(parsed)),
++  };
++}
++
++/**
++ * Merge protobuf tool calls with text-parsed tool calls (protobuf wins).
++ * @param {string} totalContent
++ * @param {string} totalThinking
++ * @param {boolean} promoteThinking
++ * @param {Array<{ id: string, type: string, function: { name: string, arguments: string } }>} protobufToolCalls
++ * @returns {{ content: string | null, toolCalls: typeof protobufToolCalls }}
++ */
++export function finalizeAssistantOutput(totalContent, totalThinking, promoteThinking, protobufToolCalls) {
++  const rawText = totalContent
++    || (promoteThinking ? totalThinking : "")
++    || "";
++
++  const { content, toolCalls: textToolCalls } = processComposerAssistantText(rawText);
++  const toolCalls = protobufToolCalls.length > 0 ? protobufToolCalls : textToolCalls;
++
++  let finalContent = content;
++  if (!finalContent && protobufToolCalls.length > 0) {
++    finalContent = null;
++  } else if (!finalContent && totalContent) {
++    finalContent = stripCursorControlTokens(totalContent).trim() || null;
++  }
++
++  return { content: finalContent, toolCalls };
++}
++
++/**
++ * Incrementally emit clean assistant text while buffering Composer control tokens.
++ */
++export class StreamingComposerFilter {
++  /** @param {boolean} [promoteThinking] */
++  constructor(promoteThinking = false) {
++    this.rawBuffer = "";
++    this.emittedContentLength = 0;
++    this.promoteThinking = promoteThinking;
++  }
++
++  /** @param {string} text */
++  setRaw(text) {
++    this.rawBuffer = text || "";
++  }
++
++  /** @returns {string} */
++  getContentDelta() {
++    if (this.promoteThinking && !shouldNormalizePromotedRaw(this.rawBuffer)) {
++      return "";
++    }
++
++    const { content } = processComposerAssistantText(this.rawBuffer);
++    const safe = content || "";
++    const delta = safe.slice(this.emittedContentLength);
++    this.emittedContentLength = safe.length;
++    return delta;
++  }
++
++  getTextToolCalls() {
++    return processComposerAssistantText(this.rawBuffer).toolCalls;
++  }
++}
+diff --git a/open-sse/utils/cursorModel.js b/open-sse/utils/cursorModel.js
+index b0dacbc..2ed3783 100644
+--- a/open-sse/utils/cursorModel.js
++++ b/open-sse/utils/cursorModel.js
+@@ -3,6 +3,9 @@
+  * Patched for cu/default empty responses (decolua#1077, jahrulnr/9router#1).
+  */
+ 
++const REDACTED_THINKING_END = "</think>";
++const FINAL_TAG = "<|final|>";
++
+ const LEGACY_MODEL_MAP = {
+   "claude-3-5-sonnet": "claude-4.5-sonnet",
+   "claude-3-5-sonnet-20241022": "claude-4.5-sonnet",
+@@ -12,6 +15,32 @@ const LEGACY_MODEL_MAP = {
+   "gpt-4o-mini": "gpt-5.2",
+ };
+ 
++/**
++ * Extract user-visible assistant text from thinking / promoted content.
++ * @param {string} thinking
++ * @returns {string}
++ */
++export function normalizePromotedText(thinking) {
++  if (!thinking) return "";
++
++  const endIdx = thinking.lastIndexOf(REDACTED_THINKING_END);
++  if (endIdx >= 0) {
++    let text = thinking.slice(endIdx + REDACTED_THINKING_END.length);
++    const finalIdx = text.indexOf(FINAL_TAG);
++    if (finalIdx >= 0) {
++      text = text.slice(finalIdx + FINAL_TAG.length);
++    }
++    return text.trimStart();
++  }
++
++  const finalIdx = thinking.indexOf(FINAL_TAG);
++  if (finalIdx >= 0) {
++    return thinking.slice(finalIdx + FINAL_TAG.length).trimStart();
++  }
++
++  return "";
++}
++
+ /**
+  * Strip provider prefix and return bare Cursor model id.
+  * @param {string} model
+@@ -62,9 +91,5 @@ export function shouldPromoteThinkingToContent(model) {
+  * @returns {string}
+  */
+ export function visibleContentFromThinking(thinking) {
+-  if (!thinking) return "";
+-  const endTag = "</think>";
+-  const endIdx = thinking.lastIndexOf(endTag);
+-  if (endIdx < 0) return "";
+-  return thinking.slice(endIdx + endTag.length).trimStart();
++  return normalizePromotedText(thinking);
+ }
+diff --git a/tests/unit/cursor-composer-tools.test.js b/tests/unit/cursor-composer-tools.test.js
+new file mode 100644
+index 0000000..9546974
+--- /dev/null
++++ b/tests/unit/cursor-composer-tools.test.js
+@@ -0,0 +1,136 @@
++import { describe, it, expect } from "vitest";
++
++import {
++  normalizePromotedText,
++  parseComposerToolCallBlock,
++  processComposerAssistantText,
++  stripCursorControlTokens,
++} from "../../open-sse/utils/cursorComposerTools.js";
++import { CursorExecutor } from "../../open-sse/executors/cursor.js";
++import { encodeField, wrapConnectRPCFrame } from "../../open-sse/utils/cursorProtobuf.js";
++
++const LEN = 2;
++
++function cursorResponseFrame({ text = "", thinking = "" }) {
++  const responseFields = [];
++
++  if (text) {
++    responseFields.push(encodeField(1, LEN, text));
++  }
++
++  if (thinking) {
++    const thinkingMessage = encodeField(1, LEN, thinking);
++    responseFields.push(encodeField(25, LEN, thinkingMessage));
++  }
++
++  const response = Buffer.concat(responseFields.map((field) => Buffer.from(field)));
++  const envelope = encodeField(2, LEN, response);
++  return Buffer.from(wrapConnectRPCFrame(envelope));
++}
++
++describe("cursorComposerTools", () => {
++  it("strips <|final|> prefix from promoted text", () => {
++    expect(normalizePromotedText("<|final|>Hello")).toBe("Hello");
++  });
++
++  it("parses Kimi-style Read tool block", () => {
++    const parsed = parseComposerToolCallBlock(
++      "Read<|tool_sep|>path /home/user/SKILL.md"
++    );
++    expect(parsed).toEqual({
++      name: "Read",
++      args: { path: "/home/user/SKILL.md" },
++    });
++  });
++
++  it("parses multi-arg Glob tool block", () => {
++    const parsed = parseComposerToolCallBlock(
++      "Glob<|tool_sep|>target_directory /home/user/skills<|tool_sep|>glob_pattern */"
++    );
++    expect(parsed).toEqual({
++      name: "Glob",
++      args: {
++        target_directory: "/home/user/skills",
++        glob_pattern: "*/",
++      },
++    });
++  });
++
++  it("extracts tool_calls and clean content from composer markers", () => {
++    const raw = [
++      "internal plan</think>",
++      "<|final|>Loading skill.",
++      "<|tool_calls_begin|>",
++      "<|tool_call_begin|>Read<|tool_sep|>path /tmp/a.md<|tool_call_end|>",
++      "<|tool_calls_end|>",
++    ].join("");
++
++    const { content, toolCalls } = processComposerAssistantText(raw);
++
++    expect(content).toBe("Loading skill.");
++    expect(toolCalls).toHaveLength(1);
++    expect(toolCalls[0].function.name).toBe("Read");
++    expect(JSON.parse(toolCalls[0].function.arguments)).toEqual({ path: "/tmp/a.md" });
++    expect(stripCursorControlTokens(raw)).not.toContain("<|tool_calls_begin|>");
++  });
++});
++
++describe("CursorExecutor composer tool markers", () => {
++  it("returns OpenAI tool_calls for cu/default thinking-only agent response", async () => {
++    const executor = new CursorExecutor();
++    const thinking = [
++      "planning</think>",
++      "<|final|>Loading skill tree.",
++      "<|tool_calls_begin|>",
++      "<|tool_call_begin|>Read<|tool_sep|>path /home/user/SKILL.md<|tool_call_end|>",
++      "<|tool_calls_end|>",
++    ].join("");
++    const buffer = cursorResponseFrame({ thinking });
++
++    const response = executor.transformProtobufToJSON(buffer, "cu/default", {
++      messages: [{ role: "user", content: "load skill" }],
++      tools: [{ type: "function", function: { name: "Read", parameters: {} } }],
++    });
++    const payload = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(payload.choices[0].finish_reason).toBe("tool_calls");
++    expect(payload.choices[0].message.content).toBe("Loading skill tree.");
++    expect(payload.choices[0].message.tool_calls).toHaveLength(1);
++    expect(payload.choices[0].message.tool_calls[0].function.name).toBe("Read");
++    expect(JSON.stringify(payload)).not.toContain("<|tool_calls_begin|>");
++  });
++
++  it("streams clean content and emits tool_calls for default model SSE", async () => {
++    const executor = new CursorExecutor();
++    const thinking = [
++      "private</think>",
++      "<|final|>OK",
++      "<|tool_calls_begin|>",
++      "<|tool_call_begin|>Glob<|tool_sep|>glob_pattern *.md<|tool_call_end|>",
++      "<|tool_calls_end|>",
++    ].join("");
++    const buffer = cursorResponseFrame({ thinking });
++
++    const response = executor.transformProtobufToSSE(buffer, "cu/default", {
++      messages: [{ role: "user", content: "glob" }],
++      tools: [{ type: "function", function: { name: "Glob", parameters: {} } }],
++    });
++    const text = await response.text();
++    const events = text
++      .split("\n\n")
++      .filter((chunk) => chunk.startsWith("data: "))
++      .map((chunk) => chunk.slice("data: ".length))
++      .filter((data) => data !== "[DONE]")
++      .map((data) => JSON.parse(data));
++
++    const content = events.map((event) => event.choices?.[0]?.delta?.content || "").join("");
++    const toolEvents = events.filter((event) => event.choices?.[0]?.delta?.tool_calls?.length);
++
++    expect(content).toBe("OK");
++    expect(toolEvents.length).toBeGreaterThan(0);
++    expect(toolEvents[0].choices[0].delta.tool_calls[0].function.name).toBe("Glob");
++    expect(events.at(-1).choices[0].finish_reason).toBe("tool_calls");
++    expect(text).not.toContain("<|final|>");
++  });
++});
+diff --git a/tests/unit/cursor-default.test.js b/tests/unit/cursor-default.test.js
+index 8c47c61..22e2dc7 100644
+--- a/tests/unit/cursor-default.test.js
++++ b/tests/unit/cursor-default.test.js
+@@ -61,6 +61,22 @@ describe("CursorExecutor default model responses", () => {
+     expect(payload.usage.completion_tokens).toBeGreaterThan(0);
+   });
+ 
++  it("strips <|final|> prefix for default model without redacted_thinking wrapper", async () => {
++    const executor = new CursorExecutor();
++    const buffer = cursorResponseFrame({
++      thinking: "<|final|>Hi there.",
++    });
++
++    const response = executor.transformProtobufToJSON(buffer, "cu/default", {
++      messages: [{ role: "user", content: "hi" }],
++    });
++    const payload = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(payload.choices[0].message.content).toBe("Hi there.");
++    expect(JSON.stringify(payload)).not.toContain("<|final|>");
++  });
++
+   it("uses visible thinking for -thinking variant models", async () => {
+     const executor = new CursorExecutor();
+     const buffer = cursorResponseFrame({

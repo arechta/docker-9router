@@ -22,10 +22,41 @@ Refresh upstream + re-apply:
 bash scripts/sync-repository.sh
 ```
 
+## `0002-arechta-cu-composer-agent-tools.patch`
+
+Adds **agentic / tool-calling support** for `cu/default`, Composer, and `-thinking` Cursor models on OpenAI-compatible `/v1/chat/completions` routes.
+
+Fixes leaked Composer control tokens (`<|final|>`, `<|tool_calls_begin|>`, `<|tool_sep|>`) and converts Kimi-style embedded tool markers into OpenAI `tool_calls` with `finish_reason: "tool_calls"`.
+
+Requires `0001` applied first.
+
+Changes:
+
+- `open-sse/utils/cursorComposerTools.js` — parse/strip Composer tokens; streaming filter
+- `open-sse/utils/cursorModel.js` — `normalizePromotedText()` for `<|final|>` + redacted thinking
+- `open-sse/executors/cursor.js` — integrate text tool parsing (JSON + SSE); force Agent when client sends `tools`
+- Unit tests: `cursor-composer-tools.test.js`, extended `cursor-default.test.js`
+
+Refresh upstream + re-apply:
+
+```bash
+bash scripts/sync-repository.sh
+```
+
 If upstream drifts, regenerate after editing `repository/`:
 
 ```bash
 cd repository
 git add -A && git diff --cached > ../patches/0001-arechta-cu-default-fix.patch
+git reset HEAD
+```
+
+For `0002` only (after `0001` baseline in a clean upstream clone):
+
+```bash
+git apply ../patches/0001-arechta-cu-default-fix.patch
+# copy edited files into repository/
+git add open-sse/utils/cursorComposerTools.js open-sse/utils/cursorModel.js open-sse/executors/cursor.js tests/unit/cursor-composer-tools.test.js tests/unit/cursor-default.test.js
+git diff --cached > ../patches/0002-arechta-cu-composer-agent-tools.patch
 git reset HEAD
 ```
