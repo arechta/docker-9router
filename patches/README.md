@@ -73,3 +73,50 @@ Changes:
 
 - `open-sse/utils/cursorComposerTools.js` — `redacted_tool_*` parsing, `normalizeCursorWireCharacters()`
 - `tests/unit/cursor-composer-tools.test.js` — production-format fixtures (ASCII escapes)
+
+## `0004-arechta-cu-lenient-tool-wire.patch`
+
+Fixes **malformed Cursor Auto wire** still leaking after `0003`:
+
+- Missing `<｜tool▁call▁begin｜>` wrapper (tool name glued to envelope)
+- Corrupted tool name (`tead` → `Read`)
+- Corrupted end tag (`<｜tool▁call▁ennd｜>` instead of `<｜tool▁call▁end｜>`)
+- Full envelope stripped even when inner blocks are incomplete
+
+Requires `0001` + `0002` + `0003` applied first.
+
+Changes:
+
+- `open-sse/utils/cursorComposerTools.js` — `parseLenientEnvelopeInner()`, `resolveToolName()`, `TOOL_CALLS_ENVELOPE_RE`
+- `tests/unit/cursor-composer-tools.test.js` — production malformed stream fixture
+
+Refresh upstream + re-apply:
+
+```bash
+bash scripts/sync-repository.sh
+```
+
+## `0005-arechta-cu-full-tool-audit.patch`
+
+Full audit hardening from [Randomblock1/cursor-openai-api](https://github.com/Randomblock1/cursor-openai-api), [pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched), [timxx/Cursor-To-OpenAI](https://github.com/timxx/Cursor-To-OpenAI).
+
+Requires `0001` + `0002` + `0003` + `0004` applied first.
+
+Changes:
+
+- `open-sse/utils/cursorComposerTools.js`
+  - `findComposerToolMarker()` + `canonicalizeComposerToolMarkers()` (flexible `｜` / `▁` markers)
+  - `toolMarkerPrefixIndex()` + SSE partial-marker buffering in `StreamingComposerFilter`
+  - `sanitizeForParsing()`, `extractJsonObject()`, JSON / inline-bracket tool bodies
+  - `parseToolCallsFromAnthropicIds()` (`toolu_bdrk_*` text fallback)
+  - `normalizeToolArgumentsForSchema()` / `normalizeOpenAIToolCalls()` (arg remaps: `file_path`→`path`, etc.)
+  - `getClientToolsFromBody()` wired through `finalizeAssistantOutput()`
+- `open-sse/utils/cursorProtobuf.js` — protobuf `toolCallV2` (field 36) + legacy field 13; nested response scan
+- `open-sse/executors/cursor.js` — pass client `tools[]` into finalize + streaming filter
+- `tests/unit/cursor-composer-tools.test.js` — schema remap, JSON body, streaming buffer tests
+
+Refresh upstream + re-apply:
+
+```bash
+bash scripts/sync-repository.sh
+```

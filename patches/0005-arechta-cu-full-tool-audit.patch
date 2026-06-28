@@ -1,0 +1,513 @@
+open-sse/executors/cursor.js             |  11 +-
+ open-sse/utils/cursorComposerTools.js    | 574 ++++++++++++++++++++++++++++---
+ open-sse/utils/cursorProtobuf.js         | 148 +++++++-
+ tests/unit/cursor-composer-tools.test.js |  43 +++
+ 4 files changed, 705 insertions(+), 71 deletions(-)
+
+--- Changes ---
+
+open-sse/executors/cursor.js
+  @@ -14,6 +14,7 @@ import {
+  +  getClientToolsFromBody,
+     StreamingComposerFilter
+   } from "../utils/cursorComposerTools.js";
+   import { estimateUsage } from "../utils/usageTracking.js";
+  @@ -472,11 +473,13 @@ export class CursorExecutor extends BaseExecutor {
+  +    const clientTools = getClientToolsFromBody(body?.tools);
+       const { content: finalContent, toolCalls: mergedToolCalls } = finalizeAssistantOutput(
+         totalContent,
+         totalThinking,
+         promoteThinking,
+  -      toolCalls
+  +      toolCalls,
+  +      clientTools
+       );
+   
+       debugLog(
+  @@ -529,7 +532,8 @@ export class CursorExecutor extends BaseExecutor {
+  -    const streamFilter = new StreamingComposerFilter(promoteThinking);
+  +    const clientTools = getClientToolsFromBody(body?.tools);
+  +    const streamFilter = new StreamingComposerFilter(promoteThinking, clientTools);
+       const toolCalls = [];
+       const toolCallsMap = new Map(); // Track streaming tool calls by ID
+       const finalizedIds = new Set();
+  @@ -732,7 +736,8 @@ export class CursorExecutor extends BaseExecutor {
+  -      mergedToolCalls
+  +      mergedToolCalls,
+  +      clientTools
+       );
+       mergedToolCalls = finalToolCalls;
+   
+  +8 -3
+
+open-sse/utils/cursorComposerTools.js
+  @@ -2,10 +2,35 @@
+  + *
+  + * Patterns adapted from Randomblock1/cursor-openai-api (marker-parser),
+  + * pwnapplehat/cursor-proxy-patched (schema arg fixes), timxx/Cursor-To-OpenAI (Anthropic IDs).
+    */
+   
+   import { normalizePromotedText } from "./cursorModel.js";
+   
+  +const TOOL_CALLS_BEGIN = "<|tool_calls_begin|>";
+  +const TOOL_CALLS_END = "<|tool_calls_end|>";
+  +const TOOL_CALL_BEGIN = "<|tool_call_begin|>";
+  +const TOOL_CALL_END = "<|tool_call_end|>";
+  +const TOOL_SEP = "<|tool_sep|>";
+  +
+  +const TOOL_MARKER_CANDIDATES = [
+  +  TOOL_CALLS_BEGIN,
+  +  TOOL_CALLS_END,
+  +  TOOL_CALL_BEGIN,
+  +  TOOL_CALL_END,
+  +  TOOL_SEP,
+  +  "<｜tool▁calls▁begin｜>",
+  +  "<｜tool▁calls▁end｜>",
+  +  "<｜tool▁call▁begin｜>",
+  +  "<｜tool▁call▁end｜>",
+  +  "<｜tool▁sep｜>",
+  +].flatMap((marker) => [
+  +  marker,
+  +  marker.replaceAll("|", "\uFF5C").replaceAll("_", "\u2581"),
+  +]);
+  +
+   /** @type {RegExp} */
+   const TOOL_CALL_BLOCK_RE =
+     /<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>([\s\S]*?)<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi;
+  @@ -28,8 +53,11 @@ const MALFORMED_TOOL_END_RE =
+  -const WIRE_FRAGMENT_RE =
+  -  /<\|[^|>]{0,80}\|>/g;
+  +const WIRE_FRAGMENT_RE = /<\|[^|>]{0,80}\|>/g;
+  +
+  +/** @type {RegExp} */
+  +const CANONICAL_MARKER_RE =
+  +  /<\s*[|｜]\s*(?:redacted[_▁])?(tool[_▁]calls[_▁]begin|tool[_▁]calls[_▁]end|tool[_▁]call[_▁]begin(?:[_▁]kimi)?|tool[_▁]call[_▁]end(?:[_▁]kimi)?|tool[_▁]sep)\s*[|｜]\s*>/g;
+   
+   /** Cursor Agent tool names + common stream-corruption aliases (Read → tead, etc.). */
+   const TOOL_NAME_ALIASES = {
+  @@ -38,15 +66,46 @@ const TOOL_NAME_ALIASES = {
+  +  read_file: "Read",
+     glob: "Glob",
+  +  glob_search: "Glob",
+     grep: "Grep",
+  +  grep_search: "Grep",
+     shell: "Shell",
+     bash: "Shell",
+  +  run_terminal_cmd: "Shell",
+     list: "LS",
+     ls: "LS",
+  +  list_dir: "LS",
+     edit: "Edit",
+  +  strreplace: "Edit",
+     write: "Write",
+     delete: "Delete",
+  +  delete_file: "Delete",
+  +};
+  +
+  +const ARG_KEY_ALIASES = {
+  +  file_path: "path",
+  +  target_file: "path",
+  +  target_directory: "path",
+  +  filepath: "path",
+  +  file: "path",
+  +  filename: "path",
+  +  file_name: "path",
+  +  dir: "path",
+  +  directory: "path",
+  +  folder: "path",
+  +  uri: "path",
+  +  globpattern: "glob_pattern",
+  +  targeting: "path",
+  +  targetdirectory: "path",
+  +  commandline: "command",
+  +  cmd: "command",
+  +  old_string: "oldText",
+  +  new_string: "newText",
+  +  text: "content",
+  +  body: "content",
+  +  data: "content",
+   };
+   
+   let toolCallIdCounter = 0;
+  @@ -56,6 +115,24 @@ function nextToolCallId() {
+  +/**
+  + * @param {unknown} tools
+  + * @returns {Array<{ name: string, parameters?: Record<string, unknown> }>}
+  + */
+  +export function getClientToolsFromBody(tools) {
+  +  if (!Array.isArray(tools)) return [];
+  +  return tools
+  +    .filter((tool) => tool?.type === "function" && typeof tool.function?.name === "string")
+  +    .map((tool) => ({
+  +      name: tool.function.name,
+  +      parameters: tool.function.parameters,
+  +    }));
+  +}
+  +
+  +function normalizeToolNameKey(value) {
+  +  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  +}
+  +
+   /**
+    * Normalize Cursor wire tokens that sometimes arrive with fullwidth pipes (｜ U+FF5C),
+    * block-element underscores (▁ U+2581), or extra whitespace around delimiters.
+  @@ -71,12 +148,78 @@ export function normalizeCursorWireCharacters(text) {
+  +/**
+  + * Canonicalize known Composer marker spellings (Randomblock1 marker-parser).
+  + * @param {string} value
+  + * @returns {string}
+  + */
+  +export function canonicalizeComposerToolMarkers(value) {
+  +  if (!value) return value;
+  +  const normalized = normalizeCursorWireCharacters(value);
+  +  return normalized.replace(CANONICAL_MARKER_RE, (_match, marker) => {
+  +    const canonical = String(marker).replaceAll("\u2581", "_").replaceAll("▁", "_");
+  +    if (canonical.includes("redacted")) {
+  +      return `<|${canonical}|>`;
+  +    }
+  +    if (canonical.includes("kimi")) {
+  +      return `<|redacted_${canonical}|>`;
+  +    }
+  +    if (canonical === "tool_sep") {
+  +      return "<|tool_sep|>";
+  +    }
+  +    if (canonical === "tool_calls_begin") return TOOL_CALLS_BEGIN;
+  +    if (canonical === "tool_calls_end") return TOOL_CALLS_END;
+  +    if (canonical === "tool_call_begin") return TOOL_CALL_BEGIN;
+  +    if (canonical === "tool_call_end") return TOOL_CALL_END;
+  +    return `<|${canonical}|>`;
+  +  });
+  +}
+  +
+   function prepareComposerWireText(text) {
+  -  return normalizeCursorWireCharacters(text);
+  +  return canonicalizeComposerToolMarkers(text);
+  +}
+  +
+  +/**
+  + * Find flexible Composer marker position (supports fullwidth pipes / block underscores).
+  + * @param {string} value
+  + * @param {string} marker e.g. "tool_calls_begin", "tool_sep"
+  + * @returns {{ index: number, length: number } | null}
+  + */
+  +export function findComposerToolMarker(value, marker) {
+  +  const markerPattern = marker.replaceAll("_", "[_▁]");
+  +  const pattern = new RegExp(`<\\s*[|｜]\\s*(?:redacted[_▁])?${markerPattern}(?:[_▁]kimi)?\\s*[|｜]\\s>`);
+  +  const match = pattern.exec(value);
+  +  return match ? { index: match.index, length: match[0].length } : null;
+  +}
+  +
+  +/**
+  + * If buffer ends with a partial marker prefix, return index where safe emit ends.
+  + * @param {string} value
+  + * @returns {number}
+  + */
+  +export function toolMarkerPrefixIndex(value) {
+  +  const max = Math.min(
+  +    value.length,
+  +    Math.max(...TOOL_MARKER_CANDIDATES.map((candidate) => candidate.length)),
+  +  );
+  +  for (let length = max; length >= 1; length -= 1) {
+  +    const index = value.length - length;
+  +    const suffix = value.slice(index);
+  +    if (TOOL_MARKER_CANDIDATES.some((candidate) => candidate.startsWith(suffix))) {
+  +      return index;
+  +    }
+  +  }
+  +
+  +  // Incomplete marker without closing |> (common mid-chunk SSE split).
+  +  const orphanOpen = /<\|[^|>]{0,48}$/.exec(value);
+  +  if (orphanOpen) {
+  +    return orphanOpen.index;
+  +  }
+  +
+  +  return -1;
+   }
+   
+   /**
+  - * Extract user-visible assistant text from thinking / promoted content.
+    * @deprecated import from cursorModel.js
+    */
+   export { normalizePromotedText } from "./cursorModel.js";
+  @@ -93,7 +236,6 @@ export function hasComposerWireMarkers(raw) {
+  -  // Corrupted partial markers (tead, tool_call_ennd)
+     return /<\|[^|>]*(?:tead|tool_call|tool_calls)/i.test(text);
+   }
+   
+  @@ -112,7 +254,6 @@ export function resolveToolName(raw) {
+  -  // Capitalize first letter for PascalCase Cursor tools (Read, Glob, ...)
+     if (/^[a-z][a-z0-9_]*$/i.test(cleaned)) {
+       return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+     }
+  @@ -120,6 +261,190 @@ export function resolveToolName(raw) {
+  +/**
+  + * Strip backtick-wrapped marker mentions before parsing (pwnapplehat sanitizeForParsing).
+  + * @param {string} text
+  + * @returns {string}
+  + */
+  +export function sanitizeForParsing(text) {
+  +  let sanitized = text.replace(/`<\/?(?:tool_call|redacted_tool[^>`]*)>`/gi, "___TOOL_TAG_REF___");
+  +  sanitized = sanitized.replace(/```[\s\S]*?```/g, (block) => {
+  +    if (/<(?:tool_call|redacted_tool|tool_calls)/i.test(block)) {
+  +      return block
+  +        .replace(/<tool_call>/gi, "___TOOL_TAG_REF___")
+  +        .replace(/<\/tool_call>/gi, "___TOOL_TAG_END_REF___");
+  +    }
+  +    return block;
+  +  });
+  +  return sanitized;
+  +}
+  +
+  +/**
+  + * Balanced-brace JSON extraction for truncated tool-call bodies.
+  + * @param {string} str
+  + * @returns {string | null}
+  + */
+  +export function extractJsonObject(str) {
+  +  const start = str.indexOf("{");
+  +  if (start === -1) return null;
+  +  let depth = 0;
+  +  let inString = false;
+  +  let escape = false;
+  +  for (let i = start; i < str.length; i += 1) {
+  +    const ch = str[i];
+  +    if (escape) {
+  +      escape = false;
+  +      continue;
+  +    }
+  +    if (ch === "\\") {
+  +      escape = true;
+  +      continue;
+  +    }
+  +    if (ch === '"') {
+  +      inString = !inString;
+  +      continue;
+  +    }
+  +    if (inString) continue;
+  +    if (ch === "{") depth += 1;
+  +    else if (ch === "}") {
+  +      depth -= 1;
+  +      if (depth === 0) return str.substring(start, i + 1);
+  +    }
+  +  }
+  +  if (depth > 0) {
+  +    let attempt = str.substring(start);
+  +    for (let d = 0; d < depth; d += 1) attempt += "}";
+  +    return attempt;
+  +  }
+  +  return null;
+  +}
+  +
+  +/**
+  + * Parse Anthropic-style tool IDs embedded in thinking text (timxx fallback).
+  + * @param {string} text
+  + * @returns {Array<{ name: string, args: Record<string, unknown>, id?: string }>}
+  + */
+  +export function parseToolCallsFromAnthropicIds(text) {
+  +  const calls = [];
+  +  const idRegex = /toolu_bdrk_[a-zA-Z0-9]{24,28}/g;
+  +  const ids = [...new Set(text.match(idRegex) || [])];
+  +  const nameToTool = Object.fromEntries(
+  +    Object.entries(TOOL_NAME_ALIASES).map(([alias, name]) => [alias, name]),
+  +  );
+  +
+  +  for (const toolCallId of ids) {
+  +    const idPos = text.indexOf(toolCallId);
+  +    const context = text.slice(Math.max(0, idPos - 400), idPos + 400);
+  +    let toolName = null;
+  +
+  +    for (const [alias, name] of Object.entries(nameToTool)) {
+  +      if (new RegExp(`\\b${alias}\\b`, "i").test(context)) {
+  +        toolName = name;
+  +        break;
+  +      }
+  +    }
+  +
+  +    if (!toolName) continue;
+  +
+  +    let rawArgs = "{}";
+  +    const argsMatch = context.match(/\{[\s\S]{0,2000}?\}/);
+  +    if (argsMatch) {
+  +      const extracted = extractJsonObject(argsMatch[0]);
+  +      if (extracted) rawArgs = extracted;
+  +    }
+  +
+  +    try {
+  +      calls.push({
+  +        name: toolName,
+  +        args: JSON.parse(rawArgs),
+  +        id: toolCallId,
+  +      });
+  +    } catch {
+  +      calls.push({ name: toolName, args: {}, id: toolCallId });
+  ... (84 lines truncated)
+  @@ -128,9 +453,7 @@ export function resolveToolName(raw) {
+  -  // Drop entire tool-call envelopes (including malformed / truncated).
+     out = out.replace(TOOL_CALLS_ENVELOPE_RE, "");
+  -
+     out = out.replace(TOOL_MARKER_RE, "");
+     out = out.replace(TOOL_CALL_BLOCK_RE, "");
+     out = out.replace(MALFORMED_TOOL_END_RE, "");
+  @@ -138,7 +461,6 @@ export function stripCursorControlTokens(text) {
+  -  // Orphan lines from partial parses (tool name / arg keys without values).
+     out = out
+       .split("\n")
+       .filter((line) => {
+  @@ -154,7 +476,6 @@ export function stripCursorControlTokens(text) {
+  - * Flatten tool-call inner payload into [toolName, key, value, key, value, ...].
+    * @param {string} inner
+    * @returns {string[]}
+    */
+  @@ -171,8 +492,94 @@ export function tokenizeToolCallInner(inner) {
+  +function parseComposerToolArgument(value) {
+  +  if (!value) return "";
+  +  if (value === "true") return true;
+  +  if (value === "false") return false;
+  +  if (value === "null") return null;
+  +  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+  +  if (
+  +    (value.startsWith("{") && value.endsWith("}")) ||
+  +    (value.startsWith("[") && value.endsWith("]"))
+  +  ) {
+  +    try {
+  +      return JSON.parse(value);
+  +    } catch {
+  +      return value;
+  +    }
+  +  }
+  +  return value;
+  +}
+  +
+  +function parseJsonToolCallBody(value) {
+  +  const trimmed = value.trim();
+  +  const jsonText = trimmed.startsWith("{") ? trimmed : extractJsonObject(trimmed);
+  +  if (!jsonText) return null;
+  +  try {
+  +    const parsed = JSON.parse(jsonText);
+  +    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  +    if (typeof parsed.name !== "string" || !parsed.name.trim()) return null;
+  +    let args = {};
+  +    if (parsed.arguments && typeof parsed.arguments === "object" && !Array.isArray(parsed.arguments)) {
+  +      args = parsed.arguments;
+  +    } else if (typeof parsed.arguments === "string" && parsed.arguments.trim()) {
+  +      try {
+  +        const decoded = JSON.parse(parsed.arguments);
+  +        if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) args = decoded;
+  +      } catch {
+  +        args = {};
+  +      }
+  +    }
+  +    return { name: resolveToolName(parsed.name.trim()), args };
+  +  } catch {
+  +    return null;
+  +  }
+  +}
+  +
+  +function splitInlineArguments(value) {
+  +  const parts = [];
+  +  let start = 0;
+  +  let quote = null;
+  +  let depth = 0;
+  +  for (let i = 0; i < value.length; i += 1) {
+  +    const char = value[i];
+  +    if (quote) {
+  +      if (char === quote && value[i - 1] !== "\\") quote = null;
+  +      continue;
+  +    }
+  +    if (char === '"' || char === "'") {
+  +      quote = char;
+  +      continue;
+  +    }
+  +    if (char === "{" || char === "[") depth += 1;
+  +    if (char === "}" || char === "]") depth = Math.max(0, depth - 1);
+  +    if (char === "," && depth === 0) {
+  +      parts.push(value.slice(start, i));
+  +      start = i + 1;
+  +    }
+  +  }
+  +  parts.push(value.slice(start));
+  +  return parts;
+  +}
+  +
+  +function parseInlineToolCall(value) {
+  +  const match = /^([A-Za-z0-9_.-]+)\s*(?:\(([\s\S]*)\)|\[([\s\S]*)\])?$/.exec(value.trim());
+  +  if (!match) return null;
+  +  const name = resolveToolName(match[1]?.trim() || "");
+  +  if (!name) return null;
+  +  const rawArgs = (match[2] ?? match[3] ?? "").trim();
+  +  const args = {};
+  +  if (rawArgs) {
+  +    for (const part of splitInlineArguments(rawArgs)) {
+  +      const argMatch = /^([A-Za-z0-9_.-]+)\s*[:=]\s*([\s\S]*)$/.exec(part.trim());
+  +      if (!argMatch?.[1]) continue;
+  +      args[argMatch[1]] = parseComposerToolArgument((argMatch[2] ?? "").trim());
+  +    }
+  +  }
+  +  return { name, args };
+  +}
+  +
+   /**
+  - * Parse key/value tokens after tool name.
+    * @param {string[]} tokens
+    * @returns {Record<string, unknown>}
+    */
+  @@ -188,8 +595,9 @@ function parseToolArgumentsFromTokens(tokens) {
+  +      const jsonText = extractJsonObject(seg) || seg;
+         try {
+  -        const parsed = JSON.parse(seg);
+  +        const parsed = JSON.parse(jsonText);
+           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+             Object.assign(args, parsed);
+             i += 1;
+  @@ -204,13 +612,13 @@ function parseToolArgumentsFromTokens(tokens) {
+  -      if (key) args[key] = value;
+  +      if (key) args[key] = parseComposerToolArgument(value);
+         i += 1;
+         continue;
+       }
+   
+       if (/^[a-z_][a-z0-9_]*$/i.test(seg) && i + 1 < tokens.length) {
+  -      args[seg] = tokens[i + 1];
+  +      args[seg] = parseComposerToolArgument(tokens[i + 1]);
+         i += 2;
+         continue;
+       }
+  @@ -225,11 +633,19 @@ function parseToolArgumentsFromTokens(tokens) {
+  - * Parse one Composer tool-call block inner payload.
+    * @param {string} inner
+    * @returns {{ name: string, args: Record<string, unknown> } | null}
+    */
+   export function parseComposerToolCallBlock(inner) {
+  +  const trimmed = inner?.trim();
+  +  if (!trimmed) return null;
+  +
+  +  const jsonBody = parseJsonToolCallBody(trimmed);
+  +  if (jsonBody) return jsonBody;
+  +
+  +  const inlineOnly = parseInlineToolCall(trimmed);
+  +  if (inlineOnly && !trimmed.includes("\n")) return inlineOnly;
+  +
+     const tokens = tokenizeToolCallInner(inner);
+     if (tokens.length === 0) return null;
+   
+  @@ -250,10 +666,6 @@ export function parseComposerToolCallBlock(inner) {
+  - * Parse tool calls from envelope inner text when strict begin/end pairs are missing.
+  - * Handles production malformed streams:
+  - *   <｜tool▁calls▁begin｜><|tead
+  - *   <｜tool▁sep｜>path\n/home/...\n<|tool_call_ennd|>
+    * @param {string} inner
+    * @returns {Array<{ name: string, args: Record<string, unknown> }>}
+    */
+  @@ -280,52 +692,93 @@ export function parseLenientEnvelopeInner(inner) {
+  +function parseStrictMarkerEnvelope(text) {
+  +  const normalized = prepareComposerWireText(text);
+  +  const begin = findComposerToolMarker(normalized, "tool_calls_begin");
+  +  if (!begin) return [];
+  +
+  +  const afterBegin = normalized.slice(begin.index + begin.length);
+  +  const end = findComposerToolMarker(afterBegin, "tool_calls_end");
+  +  const body = end ? afterBegin.slice(0, end.index) : afterBegin;
+
+... (more changes truncated)
+  +439 -19
+[full diff: rtk git diff --no-compact]

@@ -1,0 +1,266 @@
+diff --git a/open-sse/utils/cursorComposerTools.js b/open-sse/utils/cursorComposerTools.js
+index a0909e3..8ecab83 100644
+--- a/open-sse/utils/cursorComposerTools.js
++++ b/open-sse/utils/cursorComposerTools.js
+@@ -10,6 +10,10 @@ import { normalizePromotedText } from "./cursorModel.js";
+ const TOOL_CALL_BLOCK_RE =
+   /<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>([\s\S]*?)<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi;
+ 
++/** @type {RegExp} */
++const TOOL_CALLS_ENVELOPE_RE =
++  /<\|(?:redacted_)?tool_calls_begin\|>([\s\S]*?)(?:<\|(?:redacted_)?tool_calls_end\|>|$)/gi;
++
+ /** @type {RegExp} */
+ const TOOL_SEP_RE = /<\|(?:redacted_)?tool_sep\|>/gi;
+ 
+@@ -19,6 +23,32 @@ const TOOL_MARKER_RE = /<\|(?:redacted_)?tool[^|]*\|>/gi;
+ /** @type {RegExp} */
+ const LOOSE_TOOL_TOKEN_RE = /<\|[^|>]*tool[^|>]*\|>/gi;
+ 
++/** @type {RegExp} */
++const MALFORMED_TOOL_END_RE =
++  /<\|(?:redacted_)?tool_call_end[^|]*\|>|<\|tool[^|]*(?:en+d|call[^|]*)[^|]*\|>/gi;
++
++/** @type {RegExp} */
++const WIRE_FRAGMENT_RE =
++  /<\|[^|>]{0,80}\|>/g;
++
++/** Cursor Agent tool names + common stream-corruption aliases (Read → tead, etc.). */
++const TOOL_NAME_ALIASES = {
++  tead: "Read",
++  ead: "Read",
++  rad: "Read",
++  reaad: "Read",
++  read: "Read",
++  glob: "Glob",
++  grep: "Grep",
++  shell: "Shell",
++  bash: "Shell",
++  list: "LS",
++  ls: "LS",
++  edit: "Edit",
++  write: "Write",
++  delete: "Delete",
++};
++
+ let toolCallIdCounter = 0;
+ 
+ function nextToolCallId() {
+@@ -62,7 +92,32 @@ export function hasComposerWireMarkers(raw) {
+     return true;
+   }
+   TOOL_MARKER_RE.lastIndex = 0;
+-  return TOOL_MARKER_RE.test(text);
++  if (TOOL_MARKER_RE.test(text)) return true;
++  // Corrupted partial markers (tead, tool_call_ennd)
++  return /<\|[^|>]*(?:tead|tool_call|tool_calls)/i.test(text);
++}
++
++/**
++ * Resolve corrupted / lowercase tool names to Cursor client tool names.
++ * @param {string} raw
++ * @returns {string}
++ */
++export function resolveToolName(raw) {
++  const cleaned = String(raw || "")
++    .replace(/^<\|+/g, "")
++    .replace(/\|+>$/g, "")
++    .trim();
++  if (!cleaned) return "";
++
++  const alias = TOOL_NAME_ALIASES[cleaned.toLowerCase()];
++  if (alias) return alias;
++
++  // Capitalize first letter for PascalCase Cursor tools (Read, Glob, ...)
++  if (/^[a-z][a-z0-9_]*$/i.test(cleaned)) {
++    return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
++  }
++
++  return cleaned;
+ }
+ 
+ /**
+@@ -71,26 +126,45 @@ export function hasComposerWireMarkers(raw) {
+  * @returns {string}
+  */
+ export function stripCursorControlTokens(text) {
+-  let out = text;
++  let out = prepareComposerWireText(text);
++
++  // Drop entire tool-call envelopes (including malformed / truncated).
++  out = out.replace(TOOL_CALLS_ENVELOPE_RE, "");
++
+   out = out.replace(TOOL_MARKER_RE, "");
+   out = out.replace(TOOL_CALL_BLOCK_RE, "");
++  out = out.replace(MALFORMED_TOOL_END_RE, "");
+   out = out.replace(LOOSE_TOOL_TOKEN_RE, "");
++  out = out.replace(WIRE_FRAGMENT_RE, "");
+   out = out.split("<|final|>").join("");
++
++  // Orphan lines from partial parses (tool name / arg keys without values).
++  out = out
++    .split("\n")
++    .filter((line) => {
++      const t = line.trim();
++      if (!t) return false;
++      if (/^(tead|path|glob_pattern|target_directory)$/i.test(t)) return false;
++      if (/^<\|/.test(t)) return false;
++      return true;
++    })
++    .join("\n");
++
+   return out.replace(/\n{3,}/g, "\n\n").trim();
+ }
+ 
+ /**
+  * Flatten tool-call inner payload into [toolName, key, value, key, value, ...].
+- * Handles inline and multiline Cursor formats:
+- *   Read<｜tool▁sep｜>path /foo
+- *   Read\n<｜tool▁sep｜>path\n/foo
+  * @param {string} inner
+  * @returns {string[]}
+  */
+ export function tokenizeToolCallInner(inner) {
+   if (!inner?.trim()) return [];
+ 
+-  const normalized = prepareComposerWireText(inner).replace(TOOL_SEP_RE, "\n");
++  const normalized = prepareComposerWireText(inner)
++    .replace(MALFORMED_TOOL_END_RE, "")
++    .replace(TOOL_SEP_RE, "\n");
++
+   return normalized
+     .split(/\n+/)
+     .map((line) => line.trim())
+@@ -159,15 +233,14 @@ export function parseComposerToolCallBlock(inner) {
+   const tokens = tokenizeToolCallInner(inner);
+   if (tokens.length === 0) return null;
+ 
+-  let name = tokens[0];
++  let name = resolveToolName(tokens[0]);
+   let argStart = 1;
+ 
+   if (name === "function" && tokens.length > 1) {
+-    name = tokens[1];
++    name = resolveToolName(tokens[1]);
+     argStart = 2;
+   }
+ 
+-  name = name.trim();
+   if (!name) return null;
+ 
+   return {
+@@ -176,6 +249,37 @@ export function parseComposerToolCallBlock(inner) {
+   };
+ }
+ 
++/**
++ * Parse tool calls from envelope inner text when strict begin/end pairs are missing.
++ * Handles production malformed streams:
++ *   <｜tool▁calls▁begin｜><|tead
++ *   <｜tool▁sep｜>path\n/home/...\n<|tool_call_ennd|>
++ * @param {string} inner
++ * @returns {Array<{ name: string, args: Record<string, unknown> }>}
++ */
++export function parseLenientEnvelopeInner(inner) {
++  if (!inner?.trim()) return [];
++
++  const prepared = prepareComposerWireText(inner);
++  const segments = prepared.split(MALFORMED_TOOL_END_RE);
++  const calls = [];
++
++  for (const segment of segments) {
++    let trimmed = segment.trim();
++    if (!trimmed) continue;
++
++    trimmed = trimmed.replace(/^<\|(?:redacted_)?tool_call_begin[^|]*\|>/i, "").trim();
++    if (!trimmed) continue;
++
++    const parsed = parseComposerToolCallBlock(trimmed);
++    if (parsed?.name) {
++      calls.push(parsed);
++    }
++  }
++
++  return calls;
++}
++
+ /**
+  * Convert parsed tool call to OpenAI chat.completion tool_calls entry.
+  * @param {{ name: string, args: Record<string, unknown> }} parsed
+@@ -207,6 +311,7 @@ export function processComposerAssistantText(raw) {
+   const text = promoted || prepared;
+   const toolCalls = [];
+   const blocks = [];
++  const consumedRanges = [];
+ 
+   TOOL_CALL_BLOCK_RE.lastIndex = 0;
+   let match = TOOL_CALL_BLOCK_RE.exec(text);
+@@ -215,14 +320,31 @@ export function processComposerAssistantText(raw) {
+     match = TOOL_CALL_BLOCK_RE.exec(text);
+   }
+ 
+-  let content = text;
+-  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+-    const block = blocks[i];
++  for (const block of blocks) {
+     const parsed = parseComposerToolCallBlock(block.inner);
+     if (parsed) {
+-      toolCalls.unshift(parsed);
++      toolCalls.push(parsed);
+     }
+-    content = content.slice(0, block.start) + content.slice(block.start + block.full.length);
++    consumedRanges.push([block.start, block.start + block.full.length]);
++  }
++
++  if (toolCalls.length === 0) {
++    TOOL_CALLS_ENVELOPE_RE.lastIndex = 0;
++    let envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++    while (envelopeMatch) {
++      const innerCalls = parseLenientEnvelopeInner(envelopeMatch[1]);
++      toolCalls.push(...innerCalls);
++      consumedRanges.push([
++        envelopeMatch.index,
++        envelopeMatch.index + envelopeMatch[0].length,
++      ]);
++      envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++    }
++  }
++
++  let content = text;
++  for (const [start, end] of consumedRanges.sort((a, b) => b[0] - a[0])) {
++    content = content.slice(0, start) + content.slice(end);
+   }
+ 
+   content = stripCursorControlTokens(content);
+diff --git a/tests/unit/cursor-composer-tools.test.js b/tests/unit/cursor-composer-tools.test.js
+index 7cb4f10..eebd1d1 100644
+--- a/tests/unit/cursor-composer-tools.test.js
++++ b/tests/unit/cursor-composer-tools.test.js
+@@ -139,6 +139,27 @@ describe("cursorComposerTools", () => {
+     });
+   });
+ 
++  it("parses malformed production stream (tead + tool_call_ennd)", () => {
++    const corruptedToolPrefix = "\u003c\uff5ctead";
++    const corruptedEnd = "\u003c\uff5ctool\u2581call\u2581ennd\uff5c\u003e";
++    const raw = [
++      W.toolCallsBegin + corruptedToolPrefix,
++      W.toolSep + "path",
++      "/home/arechta/projects/konstruksi.ai/backend/module_document/package.json",
++      corruptedEnd,
++    ].join("\n");
++
++    const { content, toolCalls } = processComposerAssistantText(raw);
++
++    expect(content).toBeNull();
++    expect(toolCalls).toHaveLength(1);
++    expect(toolCalls[0].function.name).toBe("Read");
++    expect(JSON.parse(toolCalls[0].function.arguments)).toEqual({
++      path: "/home/arechta/projects/konstruksi.ai/backend/module_document/package.json",
++    });
++    expect(JSON.stringify({ content, toolCalls })).not.toMatch(/tead|tool_sep|tool_call/i);
++  });
++
+   it("extracts tool_calls and clean content from composer markers", () => {
+     const raw = [
+       "internal plan</think>",
