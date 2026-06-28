@@ -1,0 +1,416 @@
+diff --git a/open-sse/utils/cursorComposerTools.js b/open-sse/utils/cursorComposerTools.js
+index 8f90863..a0909e3 100644
+--- a/open-sse/utils/cursorComposerTools.js
++++ b/open-sse/utils/cursorComposerTools.js
+@@ -6,22 +6,18 @@
+ 
+ import { normalizePromotedText } from "./cursorModel.js";
+ 
+-const TOOL_CALLS_BEGIN = "<|tool_calls_begin|>";
+-const TOOL_CALLS_END = "<|tool_calls_end|>";
+-const TOOL_SEP = "<|tool_sep|>";
+-
++/** @type {RegExp} */
+ const TOOL_CALL_BLOCK_RE =
+   /<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>([\s\S]*?)<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi;
+ 
+-const OUTER_CONTROL_TOKENS = [
+-  TOOL_CALLS_BEGIN,
+-  TOOL_CALLS_END,
+-  "<|final|>",
+-  "<|tool_call_begin|>",
+-  "<|tool_call_end|>",
+-  "<｜tool▁call▁begin｜>",
+-  "<｜tool▁call▁end｜>",
+-];
++/** @type {RegExp} */
++const TOOL_SEP_RE = /<\|(?:redacted_)?tool_sep\|>/gi;
++
++/** @type {RegExp} */
++const TOOL_MARKER_RE = /<\|(?:redacted_)?tool[^|]*\|>/gi;
++
++/** @type {RegExp} */
++const LOOSE_TOOL_TOKEN_RE = /<\|[^|>]*tool[^|>]*\|>/gi;
+ 
+ let toolCallIdCounter = 0;
+ 
+@@ -30,12 +26,45 @@ function nextToolCallId() {
+   return `call_cursor_${Date.now()}_${toolCallIdCounter}`;
+ }
+ 
++/**
++ * Normalize Cursor wire tokens that sometimes arrive with fullwidth pipes (｜ U+FF5C),
++ * block-element underscores (▁ U+2581), or extra whitespace around delimiters.
++ * @param {string} text
++ * @returns {string}
++ */
++export function normalizeCursorWireCharacters(text) {
++  if (!text) return text;
++  return text
++    .replace(/\uFF5C/g, "|")
++    .replace(/\u2581/g, "_")
++    .replace(/<\s*\|\s*/g, "<|")
++    .replace(/\s*\|\s*>/g, "|>");
++}
++
++function prepareComposerWireText(text) {
++  return normalizeCursorWireCharacters(text);
++}
++
+ /**
+  * Extract user-visible assistant text from thinking / promoted content.
+  * @deprecated import from cursorModel.js
+  */
+ export { normalizePromotedText } from "./cursorModel.js";
+ 
++/**
++ * Whether raw assistant text includes Cursor promotion / tool wire markers.
++ * @param {string} raw
++ * @returns {boolean}
++ */
++export function hasComposerWireMarkers(raw) {
++  const text = prepareComposerWireText(raw);
++  if (text.includes("</think>") || text.includes("<|final|>")) {
++    return true;
++  }
++  TOOL_MARKER_RE.lastIndex = 0;
++  return TOOL_MARKER_RE.test(text);
++}
++
+ /**
+  * Remove known Cursor control tokens from text.
+  * @param {string} text
+@@ -43,46 +72,79 @@ export { normalizePromotedText } from "./cursorModel.js";
+  */
+ export function stripCursorControlTokens(text) {
+   let out = text;
+-  for (const token of OUTER_CONTROL_TOKENS) {
+-    out = out.split(token).join("");
+-  }
+-  out = out.replace(/<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>/gi, "");
+-  out = out.replace(/<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi, "");
+-  return out;
++  out = out.replace(TOOL_MARKER_RE, "");
++  out = out.replace(TOOL_CALL_BLOCK_RE, "");
++  out = out.replace(LOOSE_TOOL_TOKEN_RE, "");
++  out = out.split("<|final|>").join("");
++  return out.replace(/\n{3,}/g, "\n\n").trim();
++}
++
++/**
++ * Flatten tool-call inner payload into [toolName, key, value, key, value, ...].
++ * Handles inline and multiline Cursor formats:
++ *   Read<｜tool▁sep｜>path /foo
++ *   Read\n<｜tool▁sep｜>path\n/foo
++ * @param {string} inner
++ * @returns {string[]}
++ */
++export function tokenizeToolCallInner(inner) {
++  if (!inner?.trim()) return [];
++
++  const normalized = prepareComposerWireText(inner).replace(TOOL_SEP_RE, "\n");
++  return normalized
++    .split(/\n+/)
++    .map((line) => line.trim())
++    .filter(Boolean);
+ }
+ 
+ /**
+- * Parse key=value segments after tool name (Glob-style multi-arg).
+- * @param {string[]} segments
++ * Parse key/value tokens after tool name.
++ * @param {string[]} tokens
+  * @returns {Record<string, unknown>}
+  */
+-function parseToolArguments(segments) {
++function parseToolArgumentsFromTokens(tokens) {
+   const args = {};
++  let i = 0;
+ 
+-  for (const segment of segments) {
+-    const trimmed = segment.trim();
+-    if (!trimmed) continue;
++  while (i < tokens.length) {
++    const seg = tokens[i];
++    if (!seg) {
++      i += 1;
++      continue;
++    }
+ 
+-    if (trimmed.startsWith("{")) {
++    if (seg.startsWith("{")) {
+       try {
+-        const parsed = JSON.parse(trimmed);
++        const parsed = JSON.parse(seg);
+         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+           Object.assign(args, parsed);
++          i += 1;
+           continue;
+         }
+       } catch {
+-        // fall through to key=value parsing
++        // fall through
+       }
+     }
+ 
+-    const spaceIdx = trimmed.indexOf(" ");
++    const spaceIdx = seg.indexOf(" ");
+     if (spaceIdx > 0) {
+-      const key = trimmed.slice(0, spaceIdx).trim();
+-      const value = trimmed.slice(spaceIdx + 1).trim();
++      const key = seg.slice(0, spaceIdx).trim();
++      const value = seg.slice(spaceIdx + 1).trim();
+       if (key) args[key] = value;
+-    } else if (!Object.keys(args).length) {
+-      args.input = trimmed;
++      i += 1;
++      continue;
+     }
++
++    if (/^[a-z_][a-z0-9_]*$/i.test(seg) && i + 1 < tokens.length) {
++      args[seg] = tokens[i + 1];
++      i += 2;
++      continue;
++    }
++
++    if (!Object.keys(args).length) {
++      args.input = seg;
++    }
++    i += 1;
+   }
+ 
+   return args;
+@@ -94,17 +156,15 @@ function parseToolArguments(segments) {
+  * @returns {{ name: string, args: Record<string, unknown> } | null}
+  */
+ export function parseComposerToolCallBlock(inner) {
+-  if (!inner?.trim()) return null;
++  const tokens = tokenizeToolCallInner(inner);
++  if (tokens.length === 0) return null;
+ 
+-  const parts = inner.split(TOOL_SEP).map((part) => part.trim()).filter(Boolean);
+-  if (parts.length === 0) return null;
++  let name = tokens[0];
++  let argStart = 1;
+ 
+-  let name = parts[0];
+-  let argParts = parts.slice(1);
+-
+-  if (name === "function" && parts.length > 1) {
+-    name = parts[1];
+-    argParts = parts.slice(2);
++  if (name === "function" && tokens.length > 1) {
++    name = tokens[1];
++    argStart = 2;
+   }
+ 
+   name = name.trim();
+@@ -112,14 +172,13 @@ export function parseComposerToolCallBlock(inner) {
+ 
+   return {
+     name,
+-    args: parseToolArguments(argParts),
++    args: parseToolArgumentsFromTokens(tokens.slice(argStart)),
+   };
+ }
+ 
+ /**
+  * Convert parsed tool call to OpenAI chat.completion tool_calls entry.
+  * @param {{ name: string, args: Record<string, unknown> }} parsed
+- * @param {number} index
+  * @returns {{ id: string, type: "function", function: { name: string, arguments: string } }}
+  */
+ export function toOpenAIToolCall(parsed) {
+@@ -133,12 +192,6 @@ export function toOpenAIToolCall(parsed) {
+   };
+ }
+ 
+-function shouldNormalizePromotedRaw(raw) {
+-  return raw.includes("</think>")
+-    || raw.includes("<|final|>")
+-    || raw.includes(TOOL_CALLS_BEGIN);
+-}
+-
+ /**
+  * Strip Composer tool markers and parse embedded tool calls from assistant text.
+  * @param {string} raw
+@@ -149,7 +202,9 @@ export function processComposerAssistantText(raw) {
+     return { content: null, toolCalls: [] };
+   }
+ 
+-  let text = shouldNormalizePromotedRaw(raw) ? normalizePromotedText(raw) : raw;
++  const prepared = prepareComposerWireText(raw);
++  const promoted = normalizePromotedText(prepared);
++  const text = promoted || prepared;
+   const toolCalls = [];
+   const blocks = [];
+ 
+@@ -170,7 +225,7 @@ export function processComposerAssistantText(raw) {
+     content = content.slice(0, block.start) + content.slice(block.start + block.full.length);
+   }
+ 
+-  content = stripCursorControlTokens(content).trim();
++  content = stripCursorControlTokens(content);
+ 
+   return {
+     content: content || null,
+@@ -198,7 +253,7 @@ export function finalizeAssistantOutput(totalContent, totalThinking, promoteThin
+   if (!finalContent && protobufToolCalls.length > 0) {
+     finalContent = null;
+   } else if (!finalContent && totalContent) {
+-    finalContent = stripCursorControlTokens(totalContent).trim() || null;
++    finalContent = stripCursorControlTokens(totalContent) || null;
+   }
+ 
+   return { content: finalContent, toolCalls };
+@@ -222,7 +277,7 @@ export class StreamingComposerFilter {
+ 
+   /** @returns {string} */
+   getContentDelta() {
+-    if (this.promoteThinking && !shouldNormalizePromotedRaw(this.rawBuffer)) {
++    if (this.promoteThinking && !hasComposerWireMarkers(this.rawBuffer)) {
+       return "";
+     }
+ 
+diff --git a/tests/unit/cursor-composer-tools.test.js b/tests/unit/cursor-composer-tools.test.js
+index 9546974..7cb4f10 100644
+--- a/tests/unit/cursor-composer-tools.test.js
++++ b/tests/unit/cursor-composer-tools.test.js
+@@ -11,6 +11,21 @@ import { encodeField, wrapConnectRPCFrame } from "../../open-sse/utils/cursorPro
+ 
+ const LEN = 2;
+ 
++/** ASCII Cursor wire tokens — use escapes so editors cannot corrupt pipe chars. */
++const W = {
++  final: "\u003c\u007cfinal\u007c\u003e",
++  toolSep: "\u003c\u007credacted_tool_sep\u007c\u003e",
++  toolCallBegin: "\u003c\u007credacted_tool_call_begin\u007c\u003e",
++  toolCallEnd: "\u003c\u007credacted_tool_call_end\u007c\u003e",
++  toolCallsBegin: "\u003c\u007credacted_tool_calls_begin\u007c\u003e",
++  toolCallsEnd: "\u003c\u007credacted_tool_calls_end\u007c\u003e",
++  kimiCallBegin: "\u003c\u007credacted_tool_call_begin_kimi\u007c\u003e",
++  kimiCallEnd: "\u003c\u007credacted_tool_call_end_kimi\u007c\u003e",
++  callsBegin: "\u003c\u007ctool_calls_begin\u007c\u003e",
++  callsEnd: "\u003c\u007ctool_calls_end\u007c\u003e",
++  sep: "\u003c\u007ctool_sep\u007c\u003e",
++};
++
+ function cursorResponseFrame({ text = "", thinking = "" }) {
+   const responseFields = [];
+ 
+@@ -56,13 +71,81 @@ describe("cursorComposerTools", () => {
+     });
+   });
+ 
++  it("parses Cursor redacted_tool_* multiline wire format", () => {
++    const inner = [
++      "Read",
++      `${W.toolSep}path`,
++      "/home/arechta/.agents/skills/arechta-backend-nest/SKILL.md",
++    ].join("\n");
++    expect(parseComposerToolCallBlock(inner)).toEqual({
++      name: "Read",
++      args: { path: "/home/arechta/.agents/skills/arechta-backend-nest/SKILL.md" },
++    });
++  });
++
++  it("parses full redacted_tool_calls block with Read + Glob", () => {
++    const raw = [
++      "plan</think>Loading full arechta-backend-nest skill tree from disk.",
++      `${W.toolCallsBegin}${W.toolCallBegin}`,
++      "Read",
++      `${W.toolSep}path`,
++      "/home/arechta/.agents/skills/arechta-backend-nest/SKILL.md",
++      `${W.toolCallEnd}${W.toolCallBegin}`,
++      "Glob",
++      `${W.toolSep}target_directory`,
++      "/home/arechta/.agents/skills/arechta-backend-nest",
++      `${W.toolSep}glob_pattern`,
++      "**/*",
++      `${W.toolCallEnd}${W.toolCallsEnd}`,
++    ].join("\n");
++
++    const { content, toolCalls } = processComposerAssistantText(raw);
++
++    expect(content).toBe("Loading full arechta-backend-nest skill tree from disk.");
++    expect(toolCalls).toHaveLength(2);
++    expect(toolCalls[0].function.name).toBe("Read");
++    expect(toolCalls[1].function.name).toBe("Glob");
++    expect(JSON.parse(toolCalls[0].function.arguments)).toEqual({
++      path: "/home/arechta/.agents/skills/arechta-backend-nest/SKILL.md",
++    });
++    expect(JSON.parse(toolCalls[1].function.arguments)).toEqual({
++      target_directory: "/home/arechta/.agents/skills/arechta-backend-nest",
++      glob_pattern: "**/*",
++    });
++  });
++
++  it("parses redacted wire format without redacted_thinking wrapper", () => {
++    const raw = [
++      "Loading full arechta-backend-nest skill tree from disk.",
++      `${W.toolCallsBegin}${W.toolCallBegin}`,
++      "Read",
++      `${W.toolSep}path`,
++      "/home/user/SKILL.md",
++      `${W.toolCallEnd}${W.toolCallsEnd}`,
++    ].join("\n");
++
++    const { content, toolCalls } = processComposerAssistantText(raw);
++
++    expect(content).toBe("Loading full arechta-backend-nest skill tree from disk.");
++    expect(toolCalls).toHaveLength(1);
++  });
++
++  it("normalizes fullwidth pipe wire tokens", () => {
++    const corruptedSep = "\u003c\uff5ctool\u2581sep\uff5c\u003e";
++    const inner = ["Read", `${corruptedSep}path`, "/tmp/x"].join("\n");
++    expect(parseComposerToolCallBlock(inner)).toEqual({
++      name: "Read",
++      args: { path: "/tmp/x" },
++    });
++  });
++
+   it("extracts tool_calls and clean content from composer markers", () => {
+     const raw = [
+       "internal plan</think>",
+-      "<|final|>Loading skill.",
+-      "<|tool_calls_begin|>",
+-      "<|tool_call_begin|>Read<|tool_sep|>path /tmp/a.md<|tool_call_end|>",
+-      "<|tool_calls_end|>",
++      `${W.final}Loading skill.`,
++      W.callsBegin,
++      `${W.kimiCallBegin}Read${W.sep}path /tmp/a.md${W.kimiCallEnd}`,
++      W.callsEnd,
+     ].join("");
+ 
+     const { content, toolCalls } = processComposerAssistantText(raw);
+@@ -80,10 +163,10 @@ describe("CursorExecutor composer tool markers", () => {
+     const executor = new CursorExecutor();
+     const thinking = [
+       "planning</think>",
+-      "<|final|>Loading skill tree.",
+-      "<|tool_calls_begin|>",
+-      "<|tool_call_begin|>Read<|tool_sep|>path /home/user/SKILL.md<|tool_call_end|>",
+-      "<|tool_calls_end|>",
++      `${W.final}Loading skill tree.`,
++      W.callsBegin,
++      `${W.kimiCallBegin}Read${W.sep}path /home/user/SKILL.md${W.kimiCallEnd}`,
++      W.callsEnd,
+     ].join("");
+     const buffer = cursorResponseFrame({ thinking });
+ 
+@@ -105,10 +188,10 @@ describe("CursorExecutor composer tool markers", () => {
+     const executor = new CursorExecutor();
+     const thinking = [
+       "private</think>",
+-      "<|final|>OK",
+-      "<|tool_calls_begin|>",
+-      "<|tool_call_begin|>Glob<|tool_sep|>glob_pattern *.md<|tool_call_end|>",
+-      "<|tool_calls_end|>",
++      `${W.final}OK`,
++      W.callsBegin,
++      `${W.kimiCallBegin}Glob${W.sep}glob_pattern *.md${W.kimiCallEnd}`,
++      W.callsEnd,
+     ].join("");
+     const buffer = cursorResponseFrame({ thinking });
+ 

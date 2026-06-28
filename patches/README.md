@@ -60,3 +60,16 @@ git add open-sse/utils/cursorComposerTools.js open-sse/utils/cursorModel.js open
 git diff --cached > ../patches/0002-arechta-cu-composer-agent-tools.patch
 git reset HEAD
 ```
+
+## `0003-arechta-cu-redacted-tool-wire.patch`
+
+Fixes **real Cursor Auto wire format** seen in production: `<｜tool▁calls▁begin｜>`, `<｜tool▁sep｜>`, multiline key/value args (not only Kimi `<|tool_sep|>` inline).
+
+Also normalizes fullwidth pipe / block-char variants (U+FF5C, U+2581) before parsing.
+
+Requires `0001` + `0002` applied first.
+
+Changes:
+
+- `open-sse/utils/cursorComposerTools.js` — `redacted_tool_*` parsing, `normalizeCursorWireCharacters()`
+- `tests/unit/cursor-composer-tools.test.js` — production-format fixtures (ASCII escapes)
