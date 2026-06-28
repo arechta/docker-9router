@@ -17,6 +17,8 @@ if [[ -d "${REPO_DIR}/.git" ]]; then
   git -C "${REPO_DIR}" fetch origin "${UPSTREAM_REF}" --depth 1
   git -C "${REPO_DIR}" checkout "${UPSTREAM_REF}"
   git -C "${REPO_DIR}" reset --hard "origin/${UPSTREAM_REF}"
+  # Drop untracked files/dirs left by prior patch runs (e.g. cursorModel.js from 0001).
+  git -C "${REPO_DIR}" clean -fd
 else
   echo "==> Cloning into ${REPO_DIR}"
   git clone --depth 1 --branch "${UPSTREAM_REF}" "${UPSTREAM_URL}" "${REPO_DIR}"
@@ -33,11 +35,16 @@ if ((${#patches[@]} == 0)); then
 fi
 
 for patch in "${patches[@]}"; do
-  echo "==> Applying $(basename "${patch}")"
-  if ! git -C "${REPO_DIR}" apply --check "${patch}" 2>/dev/null; then
-    echo "WARN: patch may already be applied or upstream drifted — trying anyway"
+  name="$(basename "${patch}")"
+  echo "==> Applying ${name}"
+  if git -C "${REPO_DIR}" apply --check "${patch}" 2>/dev/null; then
+    git -C "${REPO_DIR}" apply "${patch}"
+  elif git -C "${REPO_DIR}" apply --reverse --check "${patch}" 2>/dev/null; then
+    echo "    skip: ${name} already applied"
+  else
+    echo "ERROR: ${name} does not apply cleanly (upstream drift?)" >&2
+    exit 1
   fi
-  git -C "${REPO_DIR}" apply "${patch}"
 done
 
 echo "OK: repository ready at ${REPO_DIR} (baseline ${UPSTREAM_SHA} + ${#patches[@]} patch(es))"
