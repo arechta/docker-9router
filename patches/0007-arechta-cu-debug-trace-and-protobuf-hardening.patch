@@ -1,0 +1,208 @@
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index 84c0bb7..fe0e665 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -24,6 +24,8 @@ import { chatChunkSse } from "../utils/sse.js";
+ import { reasoningDelta } from "../translator/concerns/reasoning.js";
+ import { FORMATS } from "../translator/formats.js";
+ import { proxyAwareFetch } from "../utils/proxyFetch.js";
++import fs from "fs";
++import path from "path";
+ import zlib from "zlib";
+ 
+ // Detect cloud environment
+@@ -54,6 +56,59 @@ const CURSOR_STREAM_DEBUG = process.env.CURSOR_STREAM_DEBUG === "1";
+ const debugLog = (...args) => {
+   if (CURSOR_STREAM_DEBUG) console.log(...args);
+ };
++const CURSOR_TRACE_RESPONSES = process.env.CURSOR_TRACE_RESPONSES === "1";
++const CURSOR_TRACE_MAX_CHARS = Math.max(1000, Number(process.env.CURSOR_TRACE_MAX_CHARS || 200000));
++
++function clampTraceValue(value, maxChars = CURSOR_TRACE_MAX_CHARS) {
++  if (typeof value === "string") {
++    return value.length > maxChars
++      ? { _truncated: true, _originalSize: value.length, _preview: value.slice(0, maxChars) }
++      : value;
++  }
++  if (Array.isArray(value)) {
++    return value.map((item) => clampTraceValue(item, maxChars));
++  }
++  if (value && typeof value === "object") {
++    return Object.fromEntries(
++      Object.entries(value).map(([key, item]) => [key, clampTraceValue(item, maxChars)])
++    );
++  }
++  return value;
++}
++
++function writeCursorTrace(kind, model, trace) {
++  if (!CURSOR_TRACE_RESPONSES) return;
++  try {
++    const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
++    const dir = path.join(dataDir, "logs", "cursor");
++    fs.mkdirSync(dir, { recursive: true });
++    const safeModel = String(model || "unknown").replace(/[^a-zA-Z0-9._-]/g, "-");
++    const file = path.join(dir, `${Date.now()}-${kind}-${safeModel}.json`);
++    fs.writeFileSync(file, JSON.stringify(clampTraceValue({
++      kind,
++      model,
++      timestamp: new Date().toISOString(),
++      ...trace,
++    }), null, 2));
++    debugLog(`[CURSOR TRACE] wrote ${file}`);
++  } catch (err) {
++    console.warn(`[CURSOR TRACE] failed: ${err?.message || err}`);
++  }
++}
++
++function traceDecodedFrame(frames, frameCount, payload, result) {
++  if (!CURSOR_TRACE_RESPONSES) return;
++  frames.push({
++    frame: frameCount,
++    payloadBytes: payload?.length || 0,
++    text: result?.text || null,
++    thinking: result?.thinking || null,
++    toolCall: result?.toolCall || null,
++    error: result?.error || null,
++    decodeError: result?.decodeError || null,
++    raw: result?.raw || null,
++  });
++}
+ 
+ function decompressPayload(payload, flags) {
+   // Check if payload is JSON error (starts with {"error")
+@@ -392,6 +447,7 @@ export class CursorExecutor extends BaseExecutor {
+     const toolCalls = [];
+     const toolCallsMap = new Map(); // Track streaming tool calls by ID
+     const finalizedIds = new Set();
++    const traceFrames = [];
+     let frameCount = 0;
+ 
+     debugLog(`[CURSOR BUFFER] Total length: ${buffer.length} bytes`);
+@@ -423,6 +479,7 @@ export class CursorExecutor extends BaseExecutor {
+ 
+       const result = extractTextFromResponse(new Uint8Array(payload));
+       debugLog(`[CURSOR DECODED] Frame ${frameCount}:`, result);
++      traceDecodedFrame(traceFrames, frameCount, payload, result);
+ 
+       if (result.error) {
+         const hasContent = totalContent || toolCallsMap.size > 0;
+@@ -540,6 +597,22 @@ export class CursorExecutor extends BaseExecutor {
+       usage
+     };
+ 
++    writeCursorTrace("json", model, {
++      frames: traceFrames,
++      totals: {
++        contentChars: totalContent.length,
++        thinkingChars: totalThinking.length,
++        protobufToolCalls: toolCalls.length,
++        mergedToolCalls: mergedToolCalls.length,
++      },
++      final: {
++        content: finalContent,
++        reasoning: finalReasoning,
++        toolCalls: mergedToolCalls,
++      },
++      response: completion,
++    });
++
+     return new Response(JSON.stringify(completion), {
+       status: 200,
+       headers: { "Content-Type": "application/json" }
+@@ -561,6 +634,7 @@ export class CursorExecutor extends BaseExecutor {
+     const toolCallsMap = new Map(); // Track streaming tool calls by ID
+     const finalizedIds = new Set();
+     const emittedToolCallIds = new Set();
++    const traceFrames = [];
+     let frameCount = 0;
+ 
+     debugLog(`[CURSOR BUFFER SSE] Total length: ${buffer.length} bytes`);
+@@ -592,6 +666,7 @@ export class CursorExecutor extends BaseExecutor {
+ 
+       const result = extractTextFromResponse(new Uint8Array(payload));
+       debugLog(`[CURSOR DECODED SSE] Frame ${frameCount}:`, result);
++      traceDecodedFrame(traceFrames, frameCount, payload, result);
+ 
+       if (result.error) {
+         const hasContent = chunks.length > 0 || totalContent || toolCallsMap.size > 0;
+@@ -800,8 +875,27 @@ export class CursorExecutor extends BaseExecutor {
+       })}\n\n`
+     );
+     chunks.push(SSE_DONE);
++    const outgoingSse = chunks.join("");
++
++    writeCursorTrace("sse", model, {
++      frames: traceFrames,
++      totals: {
++        contentChars: totalContent.length,
++        thinkingChars: totalThinking.length,
++        protobufToolCalls: toolCalls.length,
++        mergedToolCalls: mergedToolCalls.length,
++        chunkCount: chunks.length,
++      },
++      final: {
++        content: finalContent,
++        reasoning: finalReasoning,
++        toolCalls: mergedToolCalls,
++      },
++      chunks,
++      outgoingSse,
++    });
+ 
+-    return new Response(chunks.join(""), {
++    return new Response(outgoingSse, {
+       status: 200,
+       headers: { ...SSE_HEADERS }
+     });
+diff --git a/open-sse/utils/cursorProtobuf.js b/open-sse/utils/cursorProtobuf.js
+index 3457116..ab412b8 100644
+--- a/open-sse/utils/cursorProtobuf.js
++++ b/open-sse/utils/cursorProtobuf.js
+@@ -901,14 +901,31 @@ function extractToolCallLegacy(toolCallData) {
+   return null;
+ }
+ 
++function safeExtractToolCall(value, extractor, label) {
++  try {
++    return extractor(value);
++  } catch (err) {
++    log("EXTRACT", `${label} parse skipped: ${err.message}`);
++    return null;
++  }
++}
++
+ function extractToolCallFromFields(fields) {
+   if (fields.has(FIELD.TOOL_CALL)) {
+-    const toolCall = extractToolCall(fields.get(FIELD.TOOL_CALL)[0].value);
++    const toolCall = safeExtractToolCall(
++      fields.get(FIELD.TOOL_CALL)[0].value,
++      extractToolCall,
++      "ToolCall"
++    );
+     if (toolCall) return toolCall;
+   }
+ 
+   if (fields.has(FIELD.TOOL_CALL_V2)) {
+-    const toolCall = extractToolCallV2(fields.get(FIELD.TOOL_CALL_V2)[0].value);
++    const toolCall = safeExtractToolCall(
++      fields.get(FIELD.TOOL_CALL_V2)[0].value,
++      extractToolCallV2,
++      "ToolCallV2"
++    );
+     if (toolCall) {
+       log("EXTRACT", `ToolCallV2: ${toolCall.function.name}`);
+       return toolCall;
+@@ -916,7 +933,11 @@ function extractToolCallFromFields(fields) {
+   }
+ 
+   if (fields.has(FIELD.TOOL_CALL_LEGACY)) {
+-    const toolCall = extractToolCallLegacy(fields.get(FIELD.TOOL_CALL_LEGACY)[0].value);
++    const toolCall = safeExtractToolCall(
++      fields.get(FIELD.TOOL_CALL_LEGACY)[0].value,
++      extractToolCallLegacy,
++      "ToolCallLegacy"
++    );
+     if (toolCall) {
+       log("EXTRACT", `ToolCallLegacy: ${toolCall.function.name}`);
+       return toolCall;

@@ -22,6 +22,30 @@ Refresh upstream + re-apply:
 bash scripts/sync-repository.sh
 ```
 
+## `0007-arechta-cu-debug-trace-and-protobuf-hardening.patch`
+
+Adds opt-in production tracing for Cursor responses and hardens protobuf text extraction.
+
+Requires `0001` through `0006` applied first.
+
+Changes:
+
+- `open-sse/executors/cursor.js`
+  - `CURSOR_TRACE_RESPONSES=1` writes decoded Cursor frames, final content/reasoning/tool calls, and exact outgoing JSON/SSE to `DATA_DIR/logs/cursor/`
+  - `CURSOR_TRACE_MAX_CHARS` caps large trace fields (default `200000`)
+- `open-sse/utils/cursorProtobuf.js`
+  - Safely skips invalid tool-call parses instead of aborting nested text extraction
+  - Prevents field `1` inside a response (normal text) from becoming an empty completion when it is not a tool call
+
+Debug one production repro:
+
+```bash
+CURSOR_TRACE_RESPONSES=1
+CURSOR_STREAM_DEBUG=1
+# redeploy, run one Cursor Agent request, then inspect:
+ls -lt /opt/docker/9router/data/logs/cursor/
+```
+
 ## `0002-arechta-cu-composer-agent-tools.patch`
 
 Adds **agentic / tool-calling support** for `cu/default`, Composer, and `-thinking` Cursor models on OpenAI-compatible `/v1/chat/completions` routes.
