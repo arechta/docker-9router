@@ -1,0 +1,374 @@
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index 282a503..a1b2c3d 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -15,6 +15,11 @@
+   shouldPromoteThinkingToContent,
+ } from "../utils/cursorModel.js";
+ import {
++  isCursorReasoningMarkdownFallbackEnabled,
++  ReasoningMarkdownStreamMirror,
++  wrapReasoningAsMarkdown,
++} from "../utils/cursorReasoningMarkdown.js";
++import {
+   finalizeAssistantOutput,
+   getClientToolsFromBody,
+   StreamingComposerFilter
+@@ -264,6 +269,20 @@
+   }));
+ }
+ 
++function flushMarkdownMirror(chunks, mirror, { responseId, created, model, toolCallsLength, finalize = false }) {
++  if (!mirror?.isOpen()) return;
++  const close = finalize ? mirror.finalize() : mirror.closeBeforeContent();
++  if (!close) return;
++  emitContentDelta(chunks, {
++    responseId,
++    created,
++    model,
++    deltaContent: close,
++    toolCallsLength,
++    hasReasoning: true,
++  });
++}
++
+ function emitTextToolCalls(chunks, toolCalls, { responseId, created, model, startIndex = 0 }) {
+   for (let i = 0; i < toolCalls.length; i += 1) {
+     const tc = toolCalls[i];
+@@ -584,9 +603,12 @@
+       return createEmptyCompletionError(model);
+     }
+ 
++    const markdownFallback = isCursorReasoningMarkdownFallbackEnabled() && promoteThinking && finalReasoning;
+     const message = {
+       role: "assistant",
+-      content: finalContent || null,
++      content: markdownFallback
++        ? wrapReasoningAsMarkdown(finalReasoning, finalContent || "")
++        : (finalContent || null),
+     };
+ 
+     if (finalReasoning && promoteThinking) {
+@@ -645,6 +667,9 @@
+     const promoteThinking = shouldPromoteThinkingToContent(model);
+     const clientTools = getClientToolsFromBody(body?.tools);
+     const streamFilter = new StreamingComposerFilter(promoteThinking, clientTools);
++    const markdownMirror = isCursorReasoningMarkdownFallbackEnabled() && promoteThinking
++      ? new ReasoningMarkdownStreamMirror()
++      : null;
+     const toolCalls = [];
+     const toolCallsMap = new Map(); // Track streaming tool calls by ID
+     const finalizedIds = new Set();
+@@ -707,6 +732,14 @@
+       if (result.toolCall) {
+         const tc = result.toolCall;
+ 
++        flushMarkdownMirror(chunks, markdownMirror, {
++          responseId,
++          created,
++          model,
++          toolCallsLength: toolCalls.length,
++          finalize: true,
++        });
++
+         if (chunks.length === 0) {
+           chunks.push(chatChunkSse({ id: responseId, created, model, delta: { role: "assistant", content: "" } }));
+         }
+@@ -784,7 +817,24 @@
+           deltaReasoning,
+           toolCallsLength: toolCalls.length,
+         });
+-        const deltaContent = streamFilter.getContentDelta();
++        if (markdownMirror) {
++          const mirrorContent = markdownMirror.mirrorReasoningDelta(deltaReasoning);
++          if (mirrorContent) {
++            emitContentDelta(chunks, {
++              responseId,
++              created,
++              model,
++              deltaContent: mirrorContent,
++              toolCallsLength: toolCalls.length,
++              hasReasoning: true,
++            });
++          }
++        }
++        let deltaContent = streamFilter.getContentDelta();
++        if (markdownMirror && deltaContent) {
++          const close = markdownMirror.closeBeforeContent();
++          if (close) deltaContent = close + deltaContent;
++        }
+         emitContentDelta(chunks, {
+           responseId,
+           created,
+@@ -841,6 +891,13 @@
+     if (toolCalls.length === 0) {
+       const textToolCalls = streamFilter.getTextToolCalls();
+       if (textToolCalls.length > 0) {
++        flushMarkdownMirror(chunks, markdownMirror, {
++          responseId,
++          created,
++          model,
++          toolCallsLength: 0,
++          finalize: true,
++        });
+         if (chunks.length === 0) {
+           chunks.push(chatChunkSse({ id: responseId, created, model, delta: { role: "assistant", content: "" } }));
+         }
+diff --git a/open-sse/utils/cursorReasoningMarkdown.js b/open-sse/utils/cursorReasoningMarkdown.js
+new file mode 100644
+index 0000000..d4e5f6a
+--- /dev/null
++++ b/open-sse/utils/cursorReasoningMarkdown.js
+@@ -0,0 +1,82 @@
++/** Collapsible markdown block for BYOK clients that ignore reasoning_content (Cursor Thought panel). */
++
++export const REASONING_MARKDOWN_OPEN = "<details>\n<summary>Thinking…</summary>\n\n";
++export const REASONING_MARKDOWN_CLOSE = "\n\n</details>\n\n";
++export const REASONING_MARKDOWN_END = "\n\n</details>";
++
++/**
++ * @returns {boolean}
++ */
++export function isCursorReasoningMarkdownFallbackEnabled() {
++  return process.env.CURSOR_REASONING_MARKDOWN_FALLBACK === "1";
++}
++
++/**
++ * Wrap reasoning + optional answer text as a collapsible markdown block.
++ * @param {string} reasoning
++ * @param {string} [content]
++ * @returns {string}
++ */
++export function wrapReasoningAsMarkdown(reasoning, content = "") {
++  const trimmed = (reasoning || "").trim();
++  if (!trimmed) return content || "";
++  const answer = content || "";
++  if (answer) {
++    return `${REASONING_MARKDOWN_OPEN}${trimmed}${REASONING_MARKDOWN_CLOSE}${answer}`;
++  }
++  return `${REASONING_MARKDOWN_OPEN}${trimmed}${REASONING_MARKDOWN_END}`;
++}
++
++/**
++ * Mirrors streaming reasoning deltas into visible markdown content chunks.
++ */
++export class ReasoningMarkdownStreamMirror {
++  constructor() {
++    /** @type {boolean} */
++    this.open = false;
++    /** @type {boolean} */
++    this.closed = false;
++  }
++
++  /**
++   * @param {string} deltaReasoning
++   * @returns {string|null}
++   */
++  mirrorReasoningDelta(deltaReasoning) {
++    if (!deltaReasoning) return null;
++    let out = "";
++    if (!this.open) {
++      out += REASONING_MARKDOWN_OPEN;
++      this.open = true;
++    }
++    out += deltaReasoning;
++    return out;
++  }
++
++  /**
++   * Prefix to emit before the first visible answer chunk.
++   * @returns {string|null}
++   */
++  closeBeforeContent() {
++    if (!this.open || this.closed) return null;
++    this.closed = true;
++    return REASONING_MARKDOWN_CLOSE;
++  }
++
++  /**
++   * Close an open block when the turn ends with reasoning/tool calls only.
++   * @returns {string|null}
++   */
++  finalize() {
++    if (!this.open || this.closed) return null;
++    this.closed = true;
++    return REASONING_MARKDOWN_END;
++  }
++
++  /**
++   * @returns {boolean}
++   */
++  isOpen() {
++    return this.open && !this.closed;
++  }
++}
+diff --git a/tests/unit/cursor-default.test.js b/tests/unit/cursor-default.test.js
+index 1d80883..e7f8a9b 100644
+--- a/tests/unit/cursor-default.test.js
++++ b/tests/unit/cursor-default.test.js
+@@ -8,6 +8,10 @@
+   shouldPromoteThinkingToContent,
+   splitCursorThinkingSurface,
+ } from "../../open-sse/utils/cursorModel.js";
++import {
++  ReasoningMarkdownStreamMirror,
++  wrapReasoningAsMarkdown,
++} from "../../open-sse/utils/cursorReasoningMarkdown.js";
+ import { processComposerAssistantText } from "../../open-sse/utils/cursorComposerTools.js";
+ 
+ const LEN = 2;
+@@ -237,3 +241,104 @@
+     expect(reasoning).toContain("The user asked to load the skill");
+   });
+ });
++
++describe("cursorReasoningMarkdown fallback", () => {
++  it("wraps reasoning and content in a collapsible details block", () => {
++    const wrapped = wrapReasoningAsMarkdown("plan step", "Hello!");
++    expect(wrapped).toContain("<details>");
++    expect(wrapped).toContain("<summary>Thinking…</summary>");
++    expect(wrapped).toContain("plan step");
++    expect(wrapped).toContain("</details>");
++    expect(wrapped).toContain("Hello!");
++  });
++
++  it("mirrors streaming reasoning into content when env enabled", async () => {
++    const prev = process.env.CURSOR_REASONING_MARKDOWN_FALLBACK;
++    process.env.CURSOR_REASONING_MARKDOWN_FALLBACK = "1";
++    try {
++      const executor = new CursorExecutor();
++      const buffer = cursorResponseFrames([
++        { thinking: "The user asked to load" },
++        { thinking: " the skill.\n</think><｜final｜>**loaded**." },
++      ]);
++
++      const response = await executor.transformProtobufToSSE(buffer, "cu/default", {
++        messages: [{ role: "user", content: "load skill" }],
++      });
++      const deltas = await collectSseDeltas(response);
++      const content = deltas.map((delta) => delta.content || "").join("");
++      const reasoning = deltas.map((delta) => delta.reasoning_content || "").join("");
++
++      expect(content).toContain("<details>");
++      expect(content).toContain("The user asked to load the skill");
++      expect(content).toContain("**loaded**.");
++      expect(reasoning).toContain("The user asked to load the skill");
++    } finally {
++      if (prev === undefined) delete process.env.CURSOR_REASONING_MARKDOWN_FALLBACK;
++      else process.env.CURSOR_REASONING_MARKDOWN_FALLBACK = prev;
++    }
++  });
++
++  it("closes details before tool calls when only reasoning precedes tools", async () => {
++    const prev = process.env.CURSOR_REASONING_MARKDOWN_FALLBACK;
++    process.env.CURSOR_REASONING_MARKDOWN_FALLBACK = "1";
++    try {
++      const mirror = new ReasoningMarkdownStreamMirror();
++      expect(mirror.mirrorReasoningDelta("plan")).toContain("<details>");
++      expect(mirror.closeBeforeContent()).toContain("</details>");
++      expect(mirror.finalize()).toBeNull();
++      expect(mirror.isOpen()).toBe(false);
++
++      const executor = new CursorExecutor();
++      const buffer = cursorResponseFrames([
++        { thinking: "Need glob\n</think>" },
++        {
++          thinking: [
++            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>",
++            "Glob",
++            "<｜tool▁sep｜>glob_pattern **/*",
++            "<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
++          ].join("\n"),
++        },
++      ]);
++
++      const response = await executor.transformProtobufToSSE(buffer, "cu/default", {
++        messages: [{ role: "user", content: "load skill" }],
++      });
++      const deltas = await collectSseDeltas(response);
++      const content = deltas.map((delta) => delta.content || "").join("");
++
++      expect(content).toContain("<details>");
++      expect(content).toContain("Need glob");
++      expect(content).toContain("</details>");
++      expect(content).not.toMatch(/<details>[\s\S]*<details>/);
++    } finally {
++      if (prev === undefined) delete process.env.CURSOR_REASONING_MARKDOWN_FALLBACK;
++      else process.env.CURSOR_REASONING_MARKDOWN_FALLBACK = prev;
++    }
++  });
++
++  it("wraps non-streaming JSON message content when env enabled", async () => {
++    const prev = process.env.CURSOR_REASONING_MARKDOWN_FALLBACK;
++    process.env.CURSOR_REASONING_MARKDOWN_FALLBACK = "1";
++    try {
++      const executor = new CursorExecutor();
++      const buffer = cursorResponseFrame({
++        thinking: "internal plan</think>Hello!",
++      });
++
++      const response = await executor.transformProtobufToJSON(buffer, "cu/default", {
++        messages: [{ role: "user", content: "hi" }],
++      });
++      const payload = await response.json();
++
++      expect(payload.choices[0].message.content).toContain("<details>");
++      expect(payload.choices[0].message.content).toContain("internal plan");
++      expect(payload.choices[0].message.content).toContain("Hello!");
++      expect(payload.choices[0].message.reasoning_content).toBe("internal plan");
++    } finally {
++      if (prev === undefined) delete process.env.CURSOR_REASONING_MARKDOWN_FALLBACK;
++      else process.env.CURSOR_REASONING_MARKDOWN_FALLBACK = prev;
++    }
++  });
++});
+diff --git a/tests/unit/cursor-composer-thinking.test.js b/tests/unit/cursor-composer-thinking.test.js
+index c7e9795..f1a2b3c 100644
+--- a/tests/unit/cursor-composer-thinking.test.js
++++ b/tests/unit/cursor-composer-thinking.test.js
+@@ -44,7 +44,8 @@
+     const payload = await response.json();
+ 
+     expect(payload.choices[0].message.content).toBe("OK");
+-    expect(JSON.stringify(payload)).not.toContain("private reasoning");
++    expect(payload.choices[0].message.reasoning_content).toContain("private reasoning");
++    expect(payload.choices[0].message.content).not.toContain("private reasoning");
+     expect(payload.usage.completion_tokens).toBeGreaterThan(0);
+   });
+ 
+@@ -63,25 +64,29 @@
+     const content = events
+       .map((event) => event.choices?.[0]?.delta?.content || "")
+       .join("");
++    const reasoning = events
++      .map((event) => event.choices?.[0]?.delta?.reasoning_content || "")
++      .join("");
+ 
+     expect(content).toBe("OK");
+-    expect(JSON.stringify(events)).not.toContain("private reasoning");
++    expect(content).not.toContain("private reasoning");
++    expect(reasoning).toContain("private reasoning");
+     expect(events.at(-1).usage.completion_tokens).toBeGreaterThan(0);
+   });
+ 
+-  it("returns empty-completion error for thinking-only on non-promoted models", async () => {
++  it("extracts post-thinking answer for non-promoted models when closing tag present", async () => {
+     const executor = new CursorExecutor();
+     const buffer = cursorResponseFrame({
+       thinking: "private reasoning</think>SHOULD_NOT_APPEAR",
+     });
+ 
+-    const response = executor.transformProtobufToJSON(buffer, "gpt-5.3-codex", {
++    const response = await executor.transformProtobufToJSON(buffer, "gpt-5.3-codex", {
+       messages: [{ role: "user", content: "hi" }],
+     });
+     const payload = await response.json();
+ 
+-    expect(response.status).toBe(502);
+-    expect(payload.error?.code).toBe("empty_completion");
+-    expect(JSON.stringify(payload)).not.toContain("SHOULD_NOT_APPEAR");
++    expect(response.status).toBe(200);
++    expect(payload.choices[0].message.content).toBe("SHOULD_NOT_APPEAR");
++    expect(payload.choices[0].message.reasoning_content).toBeUndefined();
+   });
+ });

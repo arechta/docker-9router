@@ -76,6 +76,38 @@ Changes:
 - Keeps optional compatibility field behind `CURSOR_EMIT_REASONING_COMPAT=1`
 - Adds regression assertion that Cursor SSE uses `reasoning_content` only
 
+## `0010-arechta-cu-reasoning-markdown-fallback.patch`
+
+Mirrors `reasoning_content` into collapsible markdown in visible `content` when Cursor BYOK ignores the native Thought panel.
+
+Requires `0001` through `0009` applied first.
+
+Changes:
+
+- `open-sse/utils/cursorReasoningMarkdown.js` — `<details>` wrapper + streaming mirror helper
+- `open-sse/executors/cursor.js` — opt-in via `CURSOR_REASONING_MARKDOWN_FALLBACK=1` for JSON + SSE
+- `tests/unit/cursor-default.test.js` — streaming, tool-call, and JSON coverage
+- `tests/unit/cursor-composer-thinking.test.js` — align expectations with reasoning split from 0006
+
+Env:
+
+```bash
+CURSOR_REASONING_MARKDOWN_FALLBACK=1   # off by default
+```
+
+When enabled, reasoning still emits as `reasoning_content` (for clients that support it) and is duplicated into:
+
+```html
+<details>
+<summary>Thinking…</summary>
+
+{reasoning}
+
+</details>
+
+{answer}
+```
+
 ## `0002-arechta-cu-composer-agent-tools.patch`
 
 Adds **agentic / tool-calling support** for `cu/default`, Composer, and `-thinking` Cursor models on OpenAI-compatible `/v1/chat/completions` routes.
