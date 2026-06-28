@@ -12,16 +12,27 @@ UPSTREAM_REF="${NINEROUTER_UPSTREAM_REF:-master}"
 
 echo "==> 9Router upstream: ${UPSTREAM_URL} @ ${UPSTREAM_REF}"
 
-if [[ -d "${REPO_DIR}/.git" ]]; then
-  echo "==> Fetching existing clone"
-  git -C "${REPO_DIR}" fetch origin "${UPSTREAM_REF}" --depth 1
-  git -C "${REPO_DIR}" checkout "${UPSTREAM_REF}"
-  git -C "${REPO_DIR}" reset --hard "origin/${UPSTREAM_REF}"
-  # Drop untracked files/dirs left by prior patch runs (e.g. cursorModel.js from 0001).
-  git -C "${REPO_DIR}" clean -fd
-else
+clone_fresh() {
   echo "==> Cloning into ${REPO_DIR}"
+  rm -rf "${REPO_DIR}"
   git clone --depth 1 --branch "${UPSTREAM_REF}" "${UPSTREAM_URL}" "${REPO_DIR}"
+}
+
+if [[ -d "${REPO_DIR}/.git" ]]; then
+  current_url="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null || true)"
+  if [[ "${current_url}" != "${UPSTREAM_URL}" ]]; then
+    echo "==> Upstream repo changed (${current_url:-none} -> ${UPSTREAM_URL}); re-cloning"
+    clone_fresh
+  else
+    echo "==> Fetching existing clone"
+    git -C "${REPO_DIR}" fetch origin "${UPSTREAM_REF}" --depth 1
+    git -C "${REPO_DIR}" checkout "${UPSTREAM_REF}"
+    git -C "${REPO_DIR}" reset --hard "origin/${UPSTREAM_REF}"
+    # Drop untracked files/dirs left by prior patch runs (e.g. cursorModel.js from 0001).
+    git -C "${REPO_DIR}" clean -fd
+  fi
+else
+  clone_fresh
 fi
 
 UPSTREAM_SHA="$(git -C "${REPO_DIR}" rev-parse --short HEAD)"
