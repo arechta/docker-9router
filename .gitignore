@@ -1,3 +1,6 @@
 .env
 data/*
 !data/.gitkeep
+
+# Upstream decolua/9router clone — populate with scripts/sync-repository.sh
+repository/

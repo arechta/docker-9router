@@ -3,8 +3,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        NINEROUTER_VERSION: ${NINEROUTER_VERSION:-latest}
     image: ${IMAGE_NAME:-9router-local}:${IMAGE_TAG:-latest}
     pull_policy: never
     container_name: 9router

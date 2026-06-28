@@ -2,7 +2,7 @@
 
 > [← Index](./README.md) · [Bahasa Indonesia](./README.id-ID.md)
 
-Docker Compose stack for [9Router](https://github.com/decolua/9router): builds from the official [`9router`](https://www.npmjs.com/package/9router) npm package on `node:22-alpine`, persists state under `./data`, runs as a configurable non-root user.
+Docker Compose stack for [9Router](https://github.com/decolua/9router): builds from **patched upstream source** in `./repository` (not npm global), persists state under `./data`, runs as a configurable non-root user.
 
 **Dashboard (default):** http://127.0.0.1:20128
 
@@ -43,8 +43,10 @@ sudo bash scripts/init-data-permissions.sh
 ```
 Re-run after restoring `./data` from backup.
 
-### 4. Build and start
+### 4. Sync upstream source + build
+
 ```bash
+bash scripts/sync-repository.sh   # clone decolua/9router + apply patches/
 docker compose build
 docker compose up -d
 ```
@@ -76,7 +78,7 @@ For remote hosts, use SSH port forwarding or a reverse proxy — avoid binding `
 | `DOCKER_GID` | `1000` | Container GID |
 | `NINE_ROUTER_BIND` | `127.0.0.1` | Host bind (`0.0.0.0` = all interfaces) |
 | `NINE_ROUTER_PORT` | `20128` | Host and container port |
-| `NINEROUTER_VERSION` | `latest` | npm version pin for image build |
+| `NINEROUTER_UPSTREAM_REF` | `master` | Git ref for `scripts/sync-repository.sh` |
 | `IMAGE_NAME` | `9router-local` | Local Docker image name |
 | `IMAGE_TAG` | `latest` | Image tag → `${IMAGE_NAME}:${IMAGE_TAG}` |
 
@@ -111,6 +113,7 @@ data/
 ## Scripts
 | Script | Command |
 | --- | --- |
+| Sync upstream + patches | `bash scripts/sync-repository.sh` |
 | Init permissions | `sudo bash scripts/init-data-permissions.sh` |
 | Health check | `bash scripts/healthcheck.sh` |
 | Update | `bash scripts/update.sh` |
@@ -121,7 +124,7 @@ data/
 | Logs | `docker compose logs -f 9router` |
 | Stop | `docker compose stop` |
 | Start | `docker compose start` |
-| Update version | Set `NINEROUTER_VERSION` in `.env`, then `bash scripts/update.sh` |
+| Update upstream/patches | `bash scripts/update.sh` |
 | Change port | Set `NINE_ROUTER_PORT` in `.env`, then `docker compose up -d --force-recreate` |
 
 Port mapping: `${NINE_ROUTER_BIND}:${NINE_ROUTER_PORT}:${NINE_ROUTER_PORT}` → container `PORT`.

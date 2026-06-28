@@ -1,0 +1,411 @@
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index fe06d80..bb8b6d8 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -7,6 +7,12 @@ import {
+   extractTextFromResponse
+ } from "../utils/cursorProtobuf.js";
+ import { buildCursorHeaders } from "../utils/cursorChecksum.js";
++import {
++  normalizeCursorModelId,
++  resolveCursorUpstreamModel,
++  shouldPromoteThinkingToContent,
++  visibleContentFromThinking
++} from "../utils/cursorModel.js";
+ import { estimateUsage } from "../utils/usageTracking.js";
+ import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
+ import { chatChunkSse } from "../utils/sse.js";
+@@ -43,19 +49,6 @@ const debugLog = (...args) => {
+   if (CURSOR_STREAM_DEBUG) console.log(...args);
+ };
+ 
+-function isComposerModel(model) {
+-  const modelId = String(model || "").split("/").pop();
+-  return /^composer(?:-|$)/i.test(modelId);
+-}
+-
+-function visibleComposerContentFromThinking(thinking) {
+-  if (!thinking) return "";
+-  const endTag = "</think>";
+-  const endIdx = thinking.lastIndexOf(endTag);
+-  if (endIdx < 0) return "";
+-  return thinking.slice(endIdx + endTag.length).trimStart();
+-}
+-
+ function decompressPayload(payload, flags) {
+   // Check if payload is JSON error (starts with {"error")
+   if (payload.length > 10 && payload[0] === 0x7b && payload[1] === 0x22) {
+@@ -146,6 +139,24 @@ function createErrorResponse(jsonError) {
+   });
+ }
+ 
++function createEmptyCompletionError(model) {
++  return new Response(JSON.stringify({
++    error: {
++      message: `Cursor returned an empty completion for model ${model}`,
++      type: "api_error",
++      code: "empty_completion"
++    }
++  }), {
++    status: HTTP_STATUS.BAD_GATEWAY,
++    headers: { "Content-Type": "application/json" }
++  });
++}
++
++function visibleThinkingContent(model, totalThinking) {
++  if (!shouldPromoteThinkingToContent(model)) return "";
++  return visibleContentFromThinking(totalThinking);
++}
++
+ export class CursorExecutor extends BaseExecutor {
+   constructor() {
+     super("cursor", PROVIDERS.cursor);
+@@ -173,10 +184,19 @@ export class CursorExecutor extends BaseExecutor {
+     const messages = body.messages || [];
+     const tools = body.tools || [];
+     const reasoningEffort = body.reasoning_effort || null;
++    const modelId = normalizeCursorModelId(model);
++    const upstreamModel = resolveCursorUpstreamModel(model);
++    if (modelId === "default" || modelId === "auto") {
++      debugLog(`[CURSOR] Resolved ${modelId} → ${upstreamModel}`);
++    }
+     // Detect Claude Code UA to force Agent mode (issue #643)
+     const ua = credentials?.rawHeaders?.["user-agent"] || "";
+-    const forceAgentMode = ua.includes("claude-cli") || ua.includes("claude-code") || ua.includes("Claude Code");
+-    return generateCursorBody(messages, model, tools, reasoningEffort, forceAgentMode);
++    const forceAgentMode = ua.includes("claude-cli")
++      || ua.includes("claude-code")
++      || ua.includes("Claude Code")
++      || modelId === "default"
++      || modelId === "auto";
++    return generateCursorBody(messages, upstreamModel, tools, reasoningEffort, forceAgentMode);
+   }
+ 
+   async makeFetchRequest(url, headers, body, signal, proxyOptions = null) {
+@@ -394,10 +414,8 @@ export class CursorExecutor extends BaseExecutor {
+       if (result.thinking) totalThinking += result.thinking;
+     }
+ 
+-    const visibleComposerContent = isComposerModel(model)
+-      ? visibleComposerContentFromThinking(totalThinking)
+-      : "";
+-    const finalContent = totalContent || visibleComposerContent;
++    const visibleThinking = visibleThinkingContent(model, totalThinking);
++    const finalContent = totalContent || visibleThinking;
+ 
+     debugLog(
+       `[CURSOR BUFFER] Parsed ${frameCount} frames, toolCallsMap size: ${toolCallsMap.size}, finalized toolCalls: ${toolCalls.length}`
+@@ -421,6 +439,9 @@ export class CursorExecutor extends BaseExecutor {
+ 
+     debugLog(`[CURSOR BUFFER] Final toolCalls count: ${toolCalls.length}`);
+ 
++    if (!finalContent && toolCalls.length === 0) {
++      return createEmptyCompletionError(model);
++    }
+ 
+     const message = {
+       role: "assistant",
+@@ -591,9 +612,9 @@ export class CursorExecutor extends BaseExecutor {
+         }));
+       }
+ 
+-      if (isComposerModel(model) && result.thinking) {
++      if (shouldPromoteThinkingToContent(model) && result.thinking) {
+         totalThinking += result.thinking;
+-        const visibleContent = visibleComposerContentFromThinking(totalThinking);
++        const visibleContent = visibleContentFromThinking(totalThinking);
+         if (visibleContent.length > emittedComposerThinkingContentLength) {
+           const deltaContent = visibleContent.slice(emittedComposerThinkingContentLength);
+           emittedComposerThinkingContentLength = visibleContent.length;
+@@ -650,6 +671,10 @@ export class CursorExecutor extends BaseExecutor {
+       }
+     }
+ 
++    if (!totalContent && toolCalls.length === 0) {
++      return createEmptyCompletionError(model);
++    }
++
+     if (chunks.length === 0 && toolCalls.length === 0) {
+       chunks.push(chatChunkSse({ id: responseId, created, model, delta: { role: "assistant", content: "" } }));
+     }
+diff --git a/open-sse/services/model.js b/open-sse/services/model.js
+index 6558d70..67b37a5 100644
+--- a/open-sse/services/model.js
++++ b/open-sse/services/model.js
+@@ -132,5 +132,6 @@ const MODEL_PREFIX_PROVIDERS = [
+ function inferProviderFromModelName(modelName) {
+   if (!modelName) return "openai";
+   const m = modelName.toLowerCase();
++  if (m === "default" || m === "auto") return "cursor";
+   return MODEL_PREFIX_PROVIDERS.find(([re]) => re.test(m))?.[1] || "openai";
+ }
+diff --git a/open-sse/utils/cursorModel.js b/open-sse/utils/cursorModel.js
+new file mode 100644
+index 0000000..b0dacbc
+--- /dev/null
++++ b/open-sse/utils/cursorModel.js
+@@ -0,0 +1,70 @@
++/**
++ * Cursor model normalization and upstream resolution helpers.
++ * Patched for cu/default empty responses (decolua#1077, jahrulnr/9router#1).
++ */
++
++const LEGACY_MODEL_MAP = {
++  "claude-3-5-sonnet": "claude-4.5-sonnet",
++  "claude-3-5-sonnet-20241022": "claude-4.5-sonnet",
++  "claude-3-5-sonnet-20240620": "claude-4.5-sonnet",
++  "claude-3-5-haiku": "claude-4.5-haiku",
++  "gpt-4o": "gpt-5.2",
++  "gpt-4o-mini": "gpt-5.2",
++};
++
++/**
++ * Strip provider prefix and return bare Cursor model id.
++ * @param {string} model
++ * @returns {string}
++ */
++export function normalizeCursorModelId(model) {
++  const raw = String(model || "").split("/").pop() || "";
++  let id = raw;
++
++  const dateSuffix = id.match(/^(.+)-(\d{8})$/);
++  if (dateSuffix) {
++    id = dateSuffix[1];
++  }
++
++  return LEGACY_MODEL_MAP[id] || id;
++}
++
++/**
++ * Resolve model id sent to Cursor upstream protobuf.
++ * Cursor Auto is model id "default" (server picks). Bare "auto" is a client alias only.
++ * @param {string} model
++ * @returns {string}
++ */
++export function resolveCursorUpstreamModel(model) {
++  const id = normalizeCursorModelId(model);
++  if (id === "default" || id === "auto") {
++    return "default";
++  }
++  return id;
++}
++
++/**
++ * Whether thinking protobuf content should be promoted to visible assistant text.
++ * @param {string} model
++ * @returns {boolean}
++ */
++export function shouldPromoteThinkingToContent(model) {
++  const id = normalizeCursorModelId(model);
++  if (id === "default" || id === "auto") return true;
++  if (/^composer(?:-|$)/i.test(id)) return true;
++  if (/-thinking/i.test(id)) return true;
++  return false;
++}
++
++/**
++ * Extract user-visible text after redacted thinking block (Composer-style).
++ * @param {string} thinking
++ * @returns {string}
++ */
++export function visibleContentFromThinking(thinking) {
++  if (!thinking) return "";
++  const endTag = "</think>";
++  const endIdx = thinking.lastIndexOf(endTag);
++  if (endIdx < 0) return "";
++  return thinking.slice(endIdx + endTag.length).trimStart();
++}
+diff --git a/src/app/api/models/test/ping.js b/src/app/api/models/test/ping.js
+index f7ea92a..c33c672 100644
+--- a/src/app/api/models/test/ping.js
++++ b/src/app/api/models/test/ping.js
+@@ -1,6 +1,7 @@
+ import { getApiKeys } from "@/lib/localDb";
+ import { UPDATER_CONFIG } from "@/shared/constants/config";
+ import { getConsistentMachineId } from "@/shared/utils/machineId";
++import { parseSSEToOpenAIResponse } from "open-sse/handlers/chatCore/sseToJsonHandler.js";
+ 
+ const CLI_TOKEN_SALT = "9r-cli-auth";
+ 
+@@ -130,6 +131,7 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
+     return { ok: true, latencyMs, error: null, status: res.status };
+   }
+ 
++  const isCursorModel = /^(cu|cursor)\//i.test(model);
+   const res = await fetch(`${baseUrl}/api/v1/chat/completions`, {
+     method: "POST",
+     headers,
+@@ -138,7 +140,7 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
+       // Claude-on-Copilot returns empty choices at max_tokens:1 (budget is spent
+       // before a content token emits), so a 1-token probe yields a false negative.
+       max_tokens: 16,
+-      stream: false,
++      stream: isCursorModel,
+       messages: [{ role: "user", content: "hi" }],
+     }),
+     signal: AbortSignal.timeout(15000),
+@@ -147,7 +149,13 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
+ 
+   const rawText = await res.text().catch(() => "");
+   let parsed = null;
+-  try { parsed = rawText ? JSON.parse(rawText) : null; } catch {}
++  try {
++    if (isCursorModel && res.ok) {
++      parsed = parseSSEToOpenAIResponse(rawText, model);
++    } else {
++      parsed = rawText ? JSON.parse(rawText) : null;
++    }
++  } catch {}
+ 
+   if (!res.ok) {
+     const detail = parsed?.error?.message || parsed?.msg || parsed?.message || parsed?.error || rawText;
+@@ -189,5 +197,17 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
+     };
+   }
+ 
++  const message = parsed.choices[0]?.message;
++  const hasContent = typeof message?.content === "string" && message.content.length > 0;
++  const hasToolCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
++  if (!hasContent && !hasToolCalls) {
++    return {
++      ok: false,
++      latencyMs,
++      status: res.status,
++      error: "Provider returned an empty completion for this model",
++    };
++  }
++
+   return { ok: true, latencyMs, error: null, status: res.status };
+ }
+diff --git a/tests/unit/cursor-composer-thinking.test.js b/tests/unit/cursor-composer-thinking.test.js
+index 7033231..c7e9795 100644
+--- a/tests/unit/cursor-composer-thinking.test.js
++++ b/tests/unit/cursor-composer-thinking.test.js
+@@ -69,7 +69,7 @@ describe("CursorExecutor Composer thinking-field responses", () => {
+     expect(events.at(-1).usage.completion_tokens).toBeGreaterThan(0);
+   });
+ 
+-  it("does not treat thinking as visible output for non-Composer models", async () => {
++  it("returns empty-completion error for thinking-only on non-promoted models", async () => {
+     const executor = new CursorExecutor();
+     const buffer = cursorResponseFrame({
+       thinking: "private reasoning</think>SHOULD_NOT_APPEAR",
+@@ -80,7 +80,8 @@ describe("CursorExecutor Composer thinking-field responses", () => {
+     });
+     const payload = await response.json();
+ 
+-    expect(payload.choices[0].message.content).toBeNull();
++    expect(response.status).toBe(502);
++    expect(payload.error?.code).toBe("empty_completion");
+     expect(JSON.stringify(payload)).not.toContain("SHOULD_NOT_APPEAR");
+   });
+ });
+diff --git a/tests/unit/cursor-default.test.js b/tests/unit/cursor-default.test.js
+new file mode 100644
+index 0000000..8c47c61
+--- /dev/null
++++ b/tests/unit/cursor-default.test.js
+@@ -0,0 +1,103 @@
++import { describe, it, expect } from "vitest";
++
++import { CursorExecutor } from "../../open-sse/executors/cursor.js";
++import { encodeField, wrapConnectRPCFrame } from "../../open-sse/utils/cursorProtobuf.js";
++import {
++  normalizeCursorModelId,
++  resolveCursorUpstreamModel,
++  shouldPromoteThinkingToContent,
++} from "../../open-sse/utils/cursorModel.js";
++
++const LEN = 2;
++
++function cursorResponseFrame({ text = "", thinking = "" }) {
++  const responseFields = [];
++
++  if (text) {
++    responseFields.push(encodeField(1, LEN, text));
++  }
++
++  if (thinking) {
++    const thinkingMessage = encodeField(1, LEN, thinking);
++    responseFields.push(encodeField(25, LEN, thinkingMessage));
++  }
++
++  const response = Buffer.concat(responseFields.map((field) => Buffer.from(field)));
++  const envelope = encodeField(2, LEN, response);
++  return Buffer.from(wrapConnectRPCFrame(envelope));
++}
++
++describe("cursorModel helpers", () => {
++  it("normalizes legacy Claude model ids", () => {
++    expect(normalizeCursorModelId("cu/claude-3-5-sonnet-20240620")).toBe("claude-4.5-sonnet");
++  });
++
++  it("resolves default and auto to Cursor Auto upstream id", () => {
++    expect(resolveCursorUpstreamModel("cu/default")).toBe("default");
++    expect(resolveCursorUpstreamModel("auto")).toBe("default");
++  });
++
++  it("promotes thinking for default and -thinking models", () => {
++    expect(shouldPromoteThinkingToContent("cu/default")).toBe(true);
++    expect(shouldPromoteThinkingToContent("claude-4.5-sonnet-thinking")).toBe(true);
++    expect(shouldPromoteThinkingToContent("gpt-5.3-codex")).toBe(false);
++  });
++});
++
++describe("CursorExecutor default model responses", () => {
++  it("uses visible content after </think> for default model", async () => {
++    const executor = new CursorExecutor();
++    const buffer = cursorResponseFrame({
++      thinking: "internal plan</think>Hello!",
++    });
++
++    const response = executor.transformProtobufToJSON(buffer, "cu/default", {
++      messages: [{ role: "user", content: "hi" }],
++    });
++    const payload = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(payload.choices[0].message.content).toBe("Hello!");
++    expect(payload.usage.completion_tokens).toBeGreaterThan(0);
++  });
++
++  it("uses visible thinking for -thinking variant models", async () => {
++    const executor = new CursorExecutor();
++    const buffer = cursorResponseFrame({
++      thinking: "reasoning</think>Visible",
++    });
++
++    const response = executor.transformProtobufToJSON(buffer, "claude-4.5-sonnet-thinking", {
++      messages: [{ role: "user", content: "hi" }],
++    });
++    const payload = await response.json();
++
++    expect(payload.choices[0].message.content).toBe("Visible");
++  });
++
++  it("returns error for empty completion with no tool calls", async () => {
++    const executor = new CursorExecutor();
++    const response = executor.transformProtobufToJSON(Buffer.alloc(0), "cu/default", {
++      messages: [{ role: "user", content: "hi" }],
++    });
++    const payload = await response.json();
++
++    expect(response.status).toBe(502);
++    expect(payload.error?.code).toBe("empty_completion");
++  });
++
++  it("returns error for thinking-only on non-promoted models", async () => {
++    const executor = new CursorExecutor();
++    const buffer = cursorResponseFrame({
++      thinking: "private</think>hidden",
++    });
++
++    const response = executor.transformProtobufToJSON(buffer, "gpt-5.3-codex", {
++      messages: [{ role: "user", content: "hi" }],
++    });
++    const payload = await response.json();
++
++    expect(response.status).toBe(502);
++    expect(payload.error?.code).toBe("empty_completion");
++  });
++});
