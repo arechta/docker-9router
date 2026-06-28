@@ -1,0 +1,53 @@
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index 97c60b9..282a503 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -59,6 +59,7 @@ const debugLog = (...args) => {
+ };
+ const CURSOR_TRACE_RESPONSES = process.env.CURSOR_TRACE_RESPONSES === "1";
+ const CURSOR_TRACE_MAX_CHARS = Math.max(1000, Number(process.env.CURSOR_TRACE_MAX_CHARS || 200000));
++const CURSOR_EMIT_REASONING_COMPAT = process.env.CURSOR_EMIT_REASONING_COMPAT === "1";
+ 
+ function clampTraceValue(value, maxChars = CURSOR_TRACE_MAX_CHARS) {
+   if (typeof value === "string") {
+@@ -243,14 +244,23 @@ function emitContentDelta(chunks, { responseId, created, model, deltaContent, to
+ 
+ function emitReasoningDelta(chunks, { responseId, created, model, deltaReasoning, toolCallsLength }) {
+   if (!deltaReasoning) return;
++  if (chunks.length === 0 && toolCallsLength === 0) {
++    chunks.push(chatChunkSse({
++      id: responseId,
++      created,
++      model,
++      delta: { role: "assistant" }
++    }));
++  }
++  const delta = reasoningDelta(deltaReasoning, false);
++  if (CURSOR_EMIT_REASONING_COMPAT) {
++    delta.reasoning = deltaReasoning;
++  }
+   chunks.push(chatChunkSse({
+     id: responseId,
+     created,
+     model,
+-    delta: {
+-      ...reasoningDelta(deltaReasoning, chunks.length === 0 && toolCallsLength === 0),
+-      reasoning: deltaReasoning,
+-    }
++    delta
+   }));
+ }
+ 
+diff --git a/tests/unit/cursor-default.test.js b/tests/unit/cursor-default.test.js
+index 520cfe4..1d80883 100644
+--- a/tests/unit/cursor-default.test.js
++++ b/tests/unit/cursor-default.test.js
+@@ -230,6 +230,8 @@ describe("CursorExecutor default model responses", () => {
+     const content = deltas.map((delta) => delta.content || "").join("");
+     const reasoning = deltas.map((delta) => delta.reasoning_content || "").join("");
+ 
++    expect(deltas[0]).toEqual({ role: "assistant" });
++    expect(deltas.some((delta) => Object.hasOwn(delta, "reasoning"))).toBe(false);
+     expect(content).toBe("**`arechta-backend-nest`** loaded.");
+     expect(content).not.toContain("The user");
+     expect(reasoning).toContain("The user asked to load the skill");

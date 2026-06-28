@@ -63,6 +63,19 @@ Changes:
   - Covers tool-call turns with delayed `</think>` so planning text never appears as `content`
   - Covers final answer streaming from thinking field starting at visible markdown only
 
+## `0009-arechta-cu-cursor-reasoning-sse-shape.patch`
+
+Aligns Cursor-provider SSE with observed Cursor BYOK reasoning panel requirements.
+
+Requires `0001` through `0008` applied first.
+
+Changes:
+
+- Emits a role-only first chunk before reasoning: `role -> reasoning_content* -> content*`
+- Removes `delta.reasoning` by default; Cursor forum traces suggest dual reasoning channels can prevent Thought panel rendering
+- Keeps optional compatibility field behind `CURSOR_EMIT_REASONING_COMPAT=1`
+- Adds regression assertion that Cursor SSE uses `reasoning_content` only
+
 ## `0002-arechta-cu-composer-agent-tools.patch`
 
 Adds **agentic / tool-calling support** for `cu/default`, Composer, and `-thinking` Cursor models on OpenAI-compatible `/v1/chat/completions` routes.
