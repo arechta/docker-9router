@@ -1,513 +1,1135 @@
-open-sse/executors/cursor.js             |  11 +-
- open-sse/utils/cursorComposerTools.js    | 574 ++++++++++++++++++++++++++++---
- open-sse/utils/cursorProtobuf.js         | 148 +++++++-
- tests/unit/cursor-composer-tools.test.js |  43 +++
- 4 files changed, 705 insertions(+), 71 deletions(-)
-
---- Changes ---
-
-open-sse/executors/cursor.js
-  @@ -14,6 +14,7 @@ import {
-  +  getClientToolsFromBody,
-     StreamingComposerFilter
-   } from "../utils/cursorComposerTools.js";
-   import { estimateUsage } from "../utils/usageTracking.js";
-  @@ -472,11 +473,13 @@ export class CursorExecutor extends BaseExecutor {
-  +    const clientTools = getClientToolsFromBody(body?.tools);
-       const { content: finalContent, toolCalls: mergedToolCalls } = finalizeAssistantOutput(
-         totalContent,
-         totalThinking,
-         promoteThinking,
-  -      toolCalls
-  +      toolCalls,
-  +      clientTools
-       );
-   
-       debugLog(
-  @@ -529,7 +532,8 @@ export class CursorExecutor extends BaseExecutor {
-  -    const streamFilter = new StreamingComposerFilter(promoteThinking);
-  +    const clientTools = getClientToolsFromBody(body?.tools);
-  +    const streamFilter = new StreamingComposerFilter(promoteThinking, clientTools);
-       const toolCalls = [];
-       const toolCallsMap = new Map(); // Track streaming tool calls by ID
-       const finalizedIds = new Set();
-  @@ -732,7 +736,8 @@ export class CursorExecutor extends BaseExecutor {
-  -      mergedToolCalls
-  +      mergedToolCalls,
-  +      clientTools
-       );
-       mergedToolCalls = finalToolCalls;
-   
-  +8 -3
-
-open-sse/utils/cursorComposerTools.js
-  @@ -2,10 +2,35 @@
-  + *
-  + * Patterns adapted from Randomblock1/cursor-openai-api (marker-parser),
-  + * pwnapplehat/cursor-proxy-patched (schema arg fixes), timxx/Cursor-To-OpenAI (Anthropic IDs).
-    */
-   
-   import { normalizePromotedText } from "./cursorModel.js";
-   
-  +const TOOL_CALLS_BEGIN = "<|tool_calls_begin|>";
-  +const TOOL_CALLS_END = "<|tool_calls_end|>";
-  +const TOOL_CALL_BEGIN = "<|tool_call_begin|>";
-  +const TOOL_CALL_END = "<|tool_call_end|>";
-  +const TOOL_SEP = "<|tool_sep|>";
-  +
-  +const TOOL_MARKER_CANDIDATES = [
-  +  TOOL_CALLS_BEGIN,
-  +  TOOL_CALLS_END,
-  +  TOOL_CALL_BEGIN,
-  +  TOOL_CALL_END,
-  +  TOOL_SEP,
-  +  "<｜tool▁calls▁begin｜>",
-  +  "<｜tool▁calls▁end｜>",
-  +  "<｜tool▁call▁begin｜>",
-  +  "<｜tool▁call▁end｜>",
-  +  "<｜tool▁sep｜>",
-  +].flatMap((marker) => [
-  +  marker,
-  +  marker.replaceAll("|", "\uFF5C").replaceAll("_", "\u2581"),
-  +]);
-  +
-   /** @type {RegExp} */
-   const TOOL_CALL_BLOCK_RE =
-     /<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>([\s\S]*?)<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi;
-  @@ -28,8 +53,11 @@ const MALFORMED_TOOL_END_RE =
-  -const WIRE_FRAGMENT_RE =
-  -  /<\|[^|>]{0,80}\|>/g;
-  +const WIRE_FRAGMENT_RE = /<\|[^|>]{0,80}\|>/g;
-  +
-  +/** @type {RegExp} */
-  +const CANONICAL_MARKER_RE =
-  +  /<\s*[|｜]\s*(?:redacted[_▁])?(tool[_▁]calls[_▁]begin|tool[_▁]calls[_▁]end|tool[_▁]call[_▁]begin(?:[_▁]kimi)?|tool[_▁]call[_▁]end(?:[_▁]kimi)?|tool[_▁]sep)\s*[|｜]\s*>/g;
-   
-   /** Cursor Agent tool names + common stream-corruption aliases (Read → tead, etc.). */
-   const TOOL_NAME_ALIASES = {
-  @@ -38,15 +66,46 @@ const TOOL_NAME_ALIASES = {
-  +  read_file: "Read",
-     glob: "Glob",
-  +  glob_search: "Glob",
-     grep: "Grep",
-  +  grep_search: "Grep",
-     shell: "Shell",
-     bash: "Shell",
-  +  run_terminal_cmd: "Shell",
-     list: "LS",
-     ls: "LS",
-  +  list_dir: "LS",
-     edit: "Edit",
-  +  strreplace: "Edit",
-     write: "Write",
-     delete: "Delete",
-  +  delete_file: "Delete",
-  +};
-  +
-  +const ARG_KEY_ALIASES = {
-  +  file_path: "path",
-  +  target_file: "path",
-  +  target_directory: "path",
-  +  filepath: "path",
-  +  file: "path",
-  +  filename: "path",
-  +  file_name: "path",
-  +  dir: "path",
-  +  directory: "path",
-  +  folder: "path",
-  +  uri: "path",
-  +  globpattern: "glob_pattern",
-  +  targeting: "path",
-  +  targetdirectory: "path",
-  +  commandline: "command",
-  +  cmd: "command",
-  +  old_string: "oldText",
-  +  new_string: "newText",
-  +  text: "content",
-  +  body: "content",
-  +  data: "content",
-   };
-   
-   let toolCallIdCounter = 0;
-  @@ -56,6 +115,24 @@ function nextToolCallId() {
-  +/**
-  + * @param {unknown} tools
-  + * @returns {Array<{ name: string, parameters?: Record<string, unknown> }>}
-  + */
-  +export function getClientToolsFromBody(tools) {
-  +  if (!Array.isArray(tools)) return [];
-  +  return tools
-  +    .filter((tool) => tool?.type === "function" && typeof tool.function?.name === "string")
-  +    .map((tool) => ({
-  +      name: tool.function.name,
-  +      parameters: tool.function.parameters,
-  +    }));
-  +}
-  +
-  +function normalizeToolNameKey(value) {
-  +  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  +}
-  +
-   /**
-    * Normalize Cursor wire tokens that sometimes arrive with fullwidth pipes (｜ U+FF5C),
-    * block-element underscores (▁ U+2581), or extra whitespace around delimiters.
-  @@ -71,12 +148,78 @@ export function normalizeCursorWireCharacters(text) {
-  +/**
-  + * Canonicalize known Composer marker spellings (Randomblock1 marker-parser).
-  + * @param {string} value
-  + * @returns {string}
-  + */
-  +export function canonicalizeComposerToolMarkers(value) {
-  +  if (!value) return value;
-  +  const normalized = normalizeCursorWireCharacters(value);
-  +  return normalized.replace(CANONICAL_MARKER_RE, (_match, marker) => {
-  +    const canonical = String(marker).replaceAll("\u2581", "_").replaceAll("▁", "_");
-  +    if (canonical.includes("redacted")) {
-  +      return `<|${canonical}|>`;
-  +    }
-  +    if (canonical.includes("kimi")) {
-  +      return `<|redacted_${canonical}|>`;
-  +    }
-  +    if (canonical === "tool_sep") {
-  +      return "<|tool_sep|>";
-  +    }
-  +    if (canonical === "tool_calls_begin") return TOOL_CALLS_BEGIN;
-  +    if (canonical === "tool_calls_end") return TOOL_CALLS_END;
-  +    if (canonical === "tool_call_begin") return TOOL_CALL_BEGIN;
-  +    if (canonical === "tool_call_end") return TOOL_CALL_END;
-  +    return `<|${canonical}|>`;
-  +  });
-  +}
-  +
-   function prepareComposerWireText(text) {
-  -  return normalizeCursorWireCharacters(text);
-  +  return canonicalizeComposerToolMarkers(text);
-  +}
-  +
-  +/**
-  + * Find flexible Composer marker position (supports fullwidth pipes / block underscores).
-  + * @param {string} value
-  + * @param {string} marker e.g. "tool_calls_begin", "tool_sep"
-  + * @returns {{ index: number, length: number } | null}
-  + */
-  +export function findComposerToolMarker(value, marker) {
-  +  const markerPattern = marker.replaceAll("_", "[_▁]");
-  +  const pattern = new RegExp(`<\\s*[|｜]\\s*(?:redacted[_▁])?${markerPattern}(?:[_▁]kimi)?\\s*[|｜]\\s>`);
-  +  const match = pattern.exec(value);
-  +  return match ? { index: match.index, length: match[0].length } : null;
-  +}
-  +
-  +/**
-  + * If buffer ends with a partial marker prefix, return index where safe emit ends.
-  + * @param {string} value
-  + * @returns {number}
-  + */
-  +export function toolMarkerPrefixIndex(value) {
-  +  const max = Math.min(
-  +    value.length,
-  +    Math.max(...TOOL_MARKER_CANDIDATES.map((candidate) => candidate.length)),
-  +  );
-  +  for (let length = max; length >= 1; length -= 1) {
-  +    const index = value.length - length;
-  +    const suffix = value.slice(index);
-  +    if (TOOL_MARKER_CANDIDATES.some((candidate) => candidate.startsWith(suffix))) {
-  +      return index;
-  +    }
-  +  }
-  +
-  +  // Incomplete marker without closing |> (common mid-chunk SSE split).
-  +  const orphanOpen = /<\|[^|>]{0,48}$/.exec(value);
-  +  if (orphanOpen) {
-  +    return orphanOpen.index;
-  +  }
-  +
-  +  return -1;
-   }
-   
-   /**
-  - * Extract user-visible assistant text from thinking / promoted content.
-    * @deprecated import from cursorModel.js
-    */
-   export { normalizePromotedText } from "./cursorModel.js";
-  @@ -93,7 +236,6 @@ export function hasComposerWireMarkers(raw) {
-  -  // Corrupted partial markers (tead, tool_call_ennd)
-     return /<\|[^|>]*(?:tead|tool_call|tool_calls)/i.test(text);
-   }
-   
-  @@ -112,7 +254,6 @@ export function resolveToolName(raw) {
-  -  // Capitalize first letter for PascalCase Cursor tools (Read, Glob, ...)
-     if (/^[a-z][a-z0-9_]*$/i.test(cleaned)) {
-       return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+diff --git a/open-sse/executors/cursor.js b/open-sse/executors/cursor.js
+index 4ba5a30..0a7d266 100644
+--- a/open-sse/executors/cursor.js
++++ b/open-sse/executors/cursor.js
+@@ -14,6 +14,7 @@ import {
+ } from "../utils/cursorModel.js";
+ import {
+   finalizeAssistantOutput,
++  getClientToolsFromBody,
+   StreamingComposerFilter
+ } from "../utils/cursorComposerTools.js";
+ import { estimateUsage } from "../utils/usageTracking.js";
+@@ -472,11 +473,13 @@ export class CursorExecutor extends BaseExecutor {
      }
-  @@ -120,6 +261,190 @@ export function resolveToolName(raw) {
-  +/**
-  + * Strip backtick-wrapped marker mentions before parsing (pwnapplehat sanitizeForParsing).
-  + * @param {string} text
-  + * @returns {string}
-  + */
-  +export function sanitizeForParsing(text) {
-  +  let sanitized = text.replace(/`<\/?(?:tool_call|redacted_tool[^>`]*)>`/gi, "___TOOL_TAG_REF___");
-  +  sanitized = sanitized.replace(/```[\s\S]*?```/g, (block) => {
-  +    if (/<(?:tool_call|redacted_tool|tool_calls)/i.test(block)) {
-  +      return block
-  +        .replace(/<tool_call>/gi, "___TOOL_TAG_REF___")
-  +        .replace(/<\/tool_call>/gi, "___TOOL_TAG_END_REF___");
-  +    }
-  +    return block;
-  +  });
-  +  return sanitized;
-  +}
-  +
-  +/**
-  + * Balanced-brace JSON extraction for truncated tool-call bodies.
-  + * @param {string} str
-  + * @returns {string | null}
-  + */
-  +export function extractJsonObject(str) {
-  +  const start = str.indexOf("{");
-  +  if (start === -1) return null;
-  +  let depth = 0;
-  +  let inString = false;
-  +  let escape = false;
-  +  for (let i = start; i < str.length; i += 1) {
-  +    const ch = str[i];
-  +    if (escape) {
-  +      escape = false;
-  +      continue;
-  +    }
-  +    if (ch === "\\") {
-  +      escape = true;
-  +      continue;
-  +    }
-  +    if (ch === '"') {
-  +      inString = !inString;
-  +      continue;
-  +    }
-  +    if (inString) continue;
-  +    if (ch === "{") depth += 1;
-  +    else if (ch === "}") {
-  +      depth -= 1;
-  +      if (depth === 0) return str.substring(start, i + 1);
-  +    }
-  +  }
-  +  if (depth > 0) {
-  +    let attempt = str.substring(start);
-  +    for (let d = 0; d < depth; d += 1) attempt += "}";
-  +    return attempt;
-  +  }
-  +  return null;
-  +}
-  +
-  +/**
-  + * Parse Anthropic-style tool IDs embedded in thinking text (timxx fallback).
-  + * @param {string} text
-  + * @returns {Array<{ name: string, args: Record<string, unknown>, id?: string }>}
-  + */
-  +export function parseToolCallsFromAnthropicIds(text) {
-  +  const calls = [];
-  +  const idRegex = /toolu_bdrk_[a-zA-Z0-9]{24,28}/g;
-  +  const ids = [...new Set(text.match(idRegex) || [])];
-  +  const nameToTool = Object.fromEntries(
-  +    Object.entries(TOOL_NAME_ALIASES).map(([alias, name]) => [alias, name]),
-  +  );
-  +
-  +  for (const toolCallId of ids) {
-  +    const idPos = text.indexOf(toolCallId);
-  +    const context = text.slice(Math.max(0, idPos - 400), idPos + 400);
-  +    let toolName = null;
-  +
-  +    for (const [alias, name] of Object.entries(nameToTool)) {
-  +      if (new RegExp(`\\b${alias}\\b`, "i").test(context)) {
-  +        toolName = name;
-  +        break;
-  +      }
-  +    }
-  +
-  +    if (!toolName) continue;
-  +
-  +    let rawArgs = "{}";
-  +    const argsMatch = context.match(/\{[\s\S]{0,2000}?\}/);
-  +    if (argsMatch) {
-  +      const extracted = extractJsonObject(argsMatch[0]);
-  +      if (extracted) rawArgs = extracted;
-  +    }
-  +
-  +    try {
-  +      calls.push({
-  +        name: toolName,
-  +        args: JSON.parse(rawArgs),
-  +        id: toolCallId,
-  +      });
-  +    } catch {
-  +      calls.push({ name: toolName, args: {}, id: toolCallId });
-  ... (84 lines truncated)
-  @@ -128,9 +453,7 @@ export function resolveToolName(raw) {
-  -  // Drop entire tool-call envelopes (including malformed / truncated).
-     out = out.replace(TOOL_CALLS_ENVELOPE_RE, "");
-  -
-     out = out.replace(TOOL_MARKER_RE, "");
-     out = out.replace(TOOL_CALL_BLOCK_RE, "");
-     out = out.replace(MALFORMED_TOOL_END_RE, "");
-  @@ -138,7 +461,6 @@ export function stripCursorControlTokens(text) {
-  -  // Orphan lines from partial parses (tool name / arg keys without values).
-     out = out
-       .split("\n")
-       .filter((line) => {
-  @@ -154,7 +476,6 @@ export function stripCursorControlTokens(text) {
-  - * Flatten tool-call inner payload into [toolName, key, value, key, value, ...].
-    * @param {string} inner
-    * @returns {string[]}
-    */
-  @@ -171,8 +492,94 @@ export function tokenizeToolCallInner(inner) {
-  +function parseComposerToolArgument(value) {
-  +  if (!value) return "";
-  +  if (value === "true") return true;
-  +  if (value === "false") return false;
-  +  if (value === "null") return null;
-  +  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
-  +  if (
-  +    (value.startsWith("{") && value.endsWith("}")) ||
-  +    (value.startsWith("[") && value.endsWith("]"))
-  +  ) {
-  +    try {
-  +      return JSON.parse(value);
-  +    } catch {
-  +      return value;
-  +    }
-  +  }
-  +  return value;
-  +}
-  +
-  +function parseJsonToolCallBody(value) {
-  +  const trimmed = value.trim();
-  +  const jsonText = trimmed.startsWith("{") ? trimmed : extractJsonObject(trimmed);
-  +  if (!jsonText) return null;
-  +  try {
-  +    const parsed = JSON.parse(jsonText);
-  +    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-  +    if (typeof parsed.name !== "string" || !parsed.name.trim()) return null;
-  +    let args = {};
-  +    if (parsed.arguments && typeof parsed.arguments === "object" && !Array.isArray(parsed.arguments)) {
-  +      args = parsed.arguments;
-  +    } else if (typeof parsed.arguments === "string" && parsed.arguments.trim()) {
-  +      try {
-  +        const decoded = JSON.parse(parsed.arguments);
-  +        if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) args = decoded;
-  +      } catch {
-  +        args = {};
-  +      }
-  +    }
-  +    return { name: resolveToolName(parsed.name.trim()), args };
-  +  } catch {
-  +    return null;
-  +  }
-  +}
-  +
-  +function splitInlineArguments(value) {
-  +  const parts = [];
-  +  let start = 0;
-  +  let quote = null;
-  +  let depth = 0;
-  +  for (let i = 0; i < value.length; i += 1) {
-  +    const char = value[i];
-  +    if (quote) {
-  +      if (char === quote && value[i - 1] !== "\\") quote = null;
-  +      continue;
-  +    }
-  +    if (char === '"' || char === "'") {
-  +      quote = char;
-  +      continue;
-  +    }
-  +    if (char === "{" || char === "[") depth += 1;
-  +    if (char === "}" || char === "]") depth = Math.max(0, depth - 1);
-  +    if (char === "," && depth === 0) {
-  +      parts.push(value.slice(start, i));
-  +      start = i + 1;
-  +    }
-  +  }
-  +  parts.push(value.slice(start));
-  +  return parts;
-  +}
-  +
-  +function parseInlineToolCall(value) {
-  +  const match = /^([A-Za-z0-9_.-]+)\s*(?:\(([\s\S]*)\)|\[([\s\S]*)\])?$/.exec(value.trim());
-  +  if (!match) return null;
-  +  const name = resolveToolName(match[1]?.trim() || "");
-  +  if (!name) return null;
-  +  const rawArgs = (match[2] ?? match[3] ?? "").trim();
-  +  const args = {};
-  +  if (rawArgs) {
-  +    for (const part of splitInlineArguments(rawArgs)) {
-  +      const argMatch = /^([A-Za-z0-9_.-]+)\s*[:=]\s*([\s\S]*)$/.exec(part.trim());
-  +      if (!argMatch?.[1]) continue;
-  +      args[argMatch[1]] = parseComposerToolArgument((argMatch[2] ?? "").trim());
-  +    }
-  +  }
-  +  return { name, args };
-  +}
-  +
-   /**
-  - * Parse key/value tokens after tool name.
-    * @param {string[]} tokens
-    * @returns {Record<string, unknown>}
-    */
-  @@ -188,8 +595,9 @@ function parseToolArgumentsFromTokens(tokens) {
-  +      const jsonText = extractJsonObject(seg) || seg;
-         try {
-  -        const parsed = JSON.parse(seg);
-  +        const parsed = JSON.parse(jsonText);
-           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-             Object.assign(args, parsed);
-             i += 1;
-  @@ -204,13 +612,13 @@ function parseToolArgumentsFromTokens(tokens) {
-  -      if (key) args[key] = value;
-  +      if (key) args[key] = parseComposerToolArgument(value);
-         i += 1;
-         continue;
+ 
+     const promoteThinking = shouldPromoteThinkingToContent(model);
++    const clientTools = getClientToolsFromBody(body?.tools);
+     const { content: finalContent, toolCalls: mergedToolCalls } = finalizeAssistantOutput(
+       totalContent,
+       totalThinking,
+       promoteThinking,
+-      toolCalls
++      toolCalls,
++      clientTools
+     );
+ 
+     debugLog(
+@@ -529,7 +532,8 @@ export class CursorExecutor extends BaseExecutor {
+     let totalContent = "";
+     let totalThinking = "";
+     const promoteThinking = shouldPromoteThinkingToContent(model);
+-    const streamFilter = new StreamingComposerFilter(promoteThinking);
++    const clientTools = getClientToolsFromBody(body?.tools);
++    const streamFilter = new StreamingComposerFilter(promoteThinking, clientTools);
+     const toolCalls = [];
+     const toolCallsMap = new Map(); // Track streaming tool calls by ID
+     const finalizedIds = new Set();
+@@ -732,7 +736,8 @@ export class CursorExecutor extends BaseExecutor {
+       totalContent,
+       totalThinking,
+       promoteThinking,
+-      mergedToolCalls
++      mergedToolCalls,
++      clientTools
+     );
+     mergedToolCalls = finalToolCalls;
+ 
+diff --git a/open-sse/utils/cursorComposerTools.js b/open-sse/utils/cursorComposerTools.js
+index 8ecab83..c33e02b 100644
+--- a/open-sse/utils/cursorComposerTools.js
++++ b/open-sse/utils/cursorComposerTools.js
+@@ -2,10 +2,35 @@
+  * Parse Composer / Cursor Auto control tokens embedded in assistant text.
+  * cu/default and Composer models often emit Kimi-style tool markers in thinking
+  * instead of protobuf TOOL_CALL frames.
++ *
++ * Patterns adapted from Randomblock1/cursor-openai-api (marker-parser),
++ * pwnapplehat/cursor-proxy-patched (schema arg fixes), timxx/Cursor-To-OpenAI (Anthropic IDs).
+  */
+ 
+ import { normalizePromotedText } from "./cursorModel.js";
+ 
++const TOOL_CALLS_BEGIN = "<|tool_calls_begin|>";
++const TOOL_CALLS_END = "<|tool_calls_end|>";
++const TOOL_CALL_BEGIN = "<|tool_call_begin|>";
++const TOOL_CALL_END = "<|tool_call_end|>";
++const TOOL_SEP = "<|tool_sep|>";
++
++const TOOL_MARKER_CANDIDATES = [
++  TOOL_CALLS_BEGIN,
++  TOOL_CALLS_END,
++  TOOL_CALL_BEGIN,
++  TOOL_CALL_END,
++  TOOL_SEP,
++  "<｜tool▁calls▁begin｜>",
++  "<｜tool▁calls▁end｜>",
++  "<｜tool▁call▁begin｜>",
++  "<｜tool▁call▁end｜>",
++  "<｜tool▁sep｜>",
++].flatMap((marker) => [
++  marker,
++  marker.replaceAll("|", "\uFF5C").replaceAll("_", "\u2581"),
++]);
++
+ /** @type {RegExp} */
+ const TOOL_CALL_BLOCK_RE =
+   /<\|(?:redacted_)?tool_call_begin(?:_kimi)?\|>([\s\S]*?)<\|(?:redacted_)?tool_call_end(?:_kimi)?\|>/gi;
+@@ -28,8 +53,11 @@ const MALFORMED_TOOL_END_RE =
+   /<\|(?:redacted_)?tool_call_end[^|]*\|>|<\|tool[^|]*(?:en+d|call[^|]*)[^|]*\|>/gi;
+ 
+ /** @type {RegExp} */
+-const WIRE_FRAGMENT_RE =
+-  /<\|[^|>]{0,80}\|>/g;
++const WIRE_FRAGMENT_RE = /<\|[^|>]{0,80}\|>/g;
++
++/** @type {RegExp} */
++const CANONICAL_MARKER_RE =
++  /<\s*[|｜]\s*(?:redacted[_▁])?(tool[_▁]calls[_▁]begin|tool[_▁]calls[_▁]end|tool[_▁]call[_▁]begin(?:[_▁]kimi)?|tool[_▁]call[_▁]end(?:[_▁]kimi)?|tool[_▁]sep)\s*[|｜]\s*>/g;
+ 
+ /** Cursor Agent tool names + common stream-corruption aliases (Read → tead, etc.). */
+ const TOOL_NAME_ALIASES = {
+@@ -38,15 +66,46 @@ const TOOL_NAME_ALIASES = {
+   rad: "Read",
+   reaad: "Read",
+   read: "Read",
++  read_file: "Read",
+   glob: "Glob",
++  glob_search: "Glob",
+   grep: "Grep",
++  grep_search: "Grep",
+   shell: "Shell",
+   bash: "Shell",
++  run_terminal_cmd: "Shell",
+   list: "LS",
+   ls: "LS",
++  list_dir: "LS",
+   edit: "Edit",
++  strreplace: "Edit",
+   write: "Write",
+   delete: "Delete",
++  delete_file: "Delete",
++};
++
++const ARG_KEY_ALIASES = {
++  file_path: "path",
++  target_file: "path",
++  target_directory: "path",
++  filepath: "path",
++  file: "path",
++  filename: "path",
++  file_name: "path",
++  dir: "path",
++  directory: "path",
++  folder: "path",
++  uri: "path",
++  globpattern: "glob_pattern",
++  targeting: "path",
++  targetdirectory: "path",
++  commandline: "command",
++  cmd: "command",
++  old_string: "oldText",
++  new_string: "newText",
++  text: "content",
++  body: "content",
++  data: "content",
+ };
+ 
+ let toolCallIdCounter = 0;
+@@ -56,6 +115,24 @@ function nextToolCallId() {
+   return `call_cursor_${Date.now()}_${toolCallIdCounter}`;
+ }
+ 
++/**
++ * @param {unknown} tools
++ * @returns {Array<{ name: string, parameters?: Record<string, unknown> }>}
++ */
++export function getClientToolsFromBody(tools) {
++  if (!Array.isArray(tools)) return [];
++  return tools
++    .filter((tool) => tool?.type === "function" && typeof tool.function?.name === "string")
++    .map((tool) => ({
++      name: tool.function.name,
++      parameters: tool.function.parameters,
++    }));
++}
++
++function normalizeToolNameKey(value) {
++  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
++}
++
+ /**
+  * Normalize Cursor wire tokens that sometimes arrive with fullwidth pipes (｜ U+FF5C),
+  * block-element underscores (▁ U+2581), or extra whitespace around delimiters.
+@@ -71,12 +148,78 @@ export function normalizeCursorWireCharacters(text) {
+     .replace(/\s*\|\s*>/g, "|>");
+ }
+ 
++/**
++ * Canonicalize known Composer marker spellings (Randomblock1 marker-parser).
++ * @param {string} value
++ * @returns {string}
++ */
++export function canonicalizeComposerToolMarkers(value) {
++  if (!value) return value;
++  const normalized = normalizeCursorWireCharacters(value);
++  return normalized.replace(CANONICAL_MARKER_RE, (_match, marker) => {
++    const canonical = String(marker).replaceAll("\u2581", "_").replaceAll("▁", "_");
++    if (canonical.includes("redacted")) {
++      return `<|${canonical}|>`;
++    }
++    if (canonical.includes("kimi")) {
++      return `<|redacted_${canonical}|>`;
++    }
++    if (canonical === "tool_sep") {
++      return "<|tool_sep|>";
++    }
++    if (canonical === "tool_calls_begin") return TOOL_CALLS_BEGIN;
++    if (canonical === "tool_calls_end") return TOOL_CALLS_END;
++    if (canonical === "tool_call_begin") return TOOL_CALL_BEGIN;
++    if (canonical === "tool_call_end") return TOOL_CALL_END;
++    return `<|${canonical}|>`;
++  });
++}
++
+ function prepareComposerWireText(text) {
+-  return normalizeCursorWireCharacters(text);
++  return canonicalizeComposerToolMarkers(text);
++}
++
++/**
++ * Find flexible Composer marker position (supports fullwidth pipes / block underscores).
++ * @param {string} value
++ * @param {string} marker e.g. "tool_calls_begin", "tool_sep"
++ * @returns {{ index: number, length: number } | null}
++ */
++export function findComposerToolMarker(value, marker) {
++  const markerPattern = marker.replaceAll("_", "[_▁]");
++  const pattern = new RegExp(`<\\s*[|｜]\\s*(?:redacted[_▁])?${markerPattern}(?:[_▁]kimi)?\\s*[|｜]\\s>`);
++  const match = pattern.exec(value);
++  return match ? { index: match.index, length: match[0].length } : null;
++}
++
++/**
++ * If buffer ends with a partial marker prefix, return index where safe emit ends.
++ * @param {string} value
++ * @returns {number}
++ */
++export function toolMarkerPrefixIndex(value) {
++  const max = Math.min(
++    value.length,
++    Math.max(...TOOL_MARKER_CANDIDATES.map((candidate) => candidate.length)),
++  );
++  for (let length = max; length >= 1; length -= 1) {
++    const index = value.length - length;
++    const suffix = value.slice(index);
++    if (TOOL_MARKER_CANDIDATES.some((candidate) => candidate.startsWith(suffix))) {
++      return index;
++    }
++  }
++
++  // Incomplete marker without closing |> (common mid-chunk SSE split).
++  const orphanOpen = /<\|[^|>]{0,48}$/.exec(value);
++  if (orphanOpen) {
++    return orphanOpen.index;
++  }
++
++  return -1;
+ }
+ 
+ /**
+- * Extract user-visible assistant text from thinking / promoted content.
+  * @deprecated import from cursorModel.js
+  */
+ export { normalizePromotedText } from "./cursorModel.js";
+@@ -93,7 +236,6 @@ export function hasComposerWireMarkers(raw) {
+   }
+   TOOL_MARKER_RE.lastIndex = 0;
+   if (TOOL_MARKER_RE.test(text)) return true;
+-  // Corrupted partial markers (tead, tool_call_ennd)
+   return /<\|[^|>]*(?:tead|tool_call|tool_calls)/i.test(text);
+ }
+ 
+@@ -112,7 +254,6 @@ export function resolveToolName(raw) {
+   const alias = TOOL_NAME_ALIASES[cleaned.toLowerCase()];
+   if (alias) return alias;
+ 
+-  // Capitalize first letter for PascalCase Cursor tools (Read, Glob, ...)
+   if (/^[a-z][a-z0-9_]*$/i.test(cleaned)) {
+     return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+   }
+@@ -120,6 +261,190 @@ export function resolveToolName(raw) {
+   return cleaned;
+ }
+ 
++/**
++ * Strip backtick-wrapped marker mentions before parsing (pwnapplehat sanitizeForParsing).
++ * @param {string} text
++ * @returns {string}
++ */
++export function sanitizeForParsing(text) {
++  let sanitized = text.replace(/`<\/?(?:tool_call|redacted_tool[^>`]*)>`/gi, "___TOOL_TAG_REF___");
++  sanitized = sanitized.replace(/```[\s\S]*?```/g, (block) => {
++    if (/<(?:tool_call|redacted_tool|tool_calls)/i.test(block)) {
++      return block
++        .replace(/<tool_call>/gi, "___TOOL_TAG_REF___")
++        .replace(/<\/tool_call>/gi, "___TOOL_TAG_END_REF___");
++    }
++    return block;
++  });
++  return sanitized;
++}
++
++/**
++ * Balanced-brace JSON extraction for truncated tool-call bodies.
++ * @param {string} str
++ * @returns {string | null}
++ */
++export function extractJsonObject(str) {
++  const start = str.indexOf("{");
++  if (start === -1) return null;
++  let depth = 0;
++  let inString = false;
++  let escape = false;
++  for (let i = start; i < str.length; i += 1) {
++    const ch = str[i];
++    if (escape) {
++      escape = false;
++      continue;
++    }
++    if (ch === "\\") {
++      escape = true;
++      continue;
++    }
++    if (ch === '"') {
++      inString = !inString;
++      continue;
++    }
++    if (inString) continue;
++    if (ch === "{") depth += 1;
++    else if (ch === "}") {
++      depth -= 1;
++      if (depth === 0) return str.substring(start, i + 1);
++    }
++  }
++  if (depth > 0) {
++    let attempt = str.substring(start);
++    for (let d = 0; d < depth; d += 1) attempt += "}";
++    return attempt;
++  }
++  return null;
++}
++
++/**
++ * Parse Anthropic-style tool IDs embedded in thinking text (timxx fallback).
++ * @param {string} text
++ * @returns {Array<{ name: string, args: Record<string, unknown>, id?: string }>}
++ */
++export function parseToolCallsFromAnthropicIds(text) {
++  const calls = [];
++  const idRegex = /toolu_bdrk_[a-zA-Z0-9]{24,28}/g;
++  const ids = [...new Set(text.match(idRegex) || [])];
++  const nameToTool = Object.fromEntries(
++    Object.entries(TOOL_NAME_ALIASES).map(([alias, name]) => [alias, name]),
++  );
++
++  for (const toolCallId of ids) {
++    const idPos = text.indexOf(toolCallId);
++    const context = text.slice(Math.max(0, idPos - 400), idPos + 400);
++    let toolName = null;
++
++    for (const [alias, name] of Object.entries(nameToTool)) {
++      if (new RegExp(`\\b${alias}\\b`, "i").test(context)) {
++        toolName = name;
++        break;
++      }
++    }
++
++    if (!toolName) continue;
++
++    let rawArgs = "{}";
++    const argsMatch = context.match(/\{[\s\S]{0,2000}?\}/);
++    if (argsMatch) {
++      const extracted = extractJsonObject(argsMatch[0]);
++      if (extracted) rawArgs = extracted;
++    }
++
++    try {
++      calls.push({
++        name: toolName,
++        args: JSON.parse(rawArgs),
++        id: toolCallId,
++      });
++    } catch {
++      calls.push({ name: toolName, args: {}, id: toolCallId });
++    }
++  }
++
++  return calls;
++}
++
++function toolParameterProperties(tool) {
++  const parameters = tool?.parameters;
++  const properties = parameters?.properties;
++  return properties && typeof properties === "object" ? Object.keys(properties) : [];
++}
++
++function resolveToolSpec(emittedName, clientTools) {
++  const exact = clientTools.find((tool) => tool.name === emittedName);
++  if (exact) return exact;
++  const normalized = normalizeToolNameKey(emittedName);
++  return clientTools.find((tool) => normalizeToolNameKey(tool.name) === normalized);
++}
++
++/**
++ * Schema-aware argument normalization (Randomblock1 openai-map + pwn validateAndFixToolArgs).
++ * @param {Record<string, unknown>} args
++ * @param {{ name: string, parameters?: Record<string, unknown> } | undefined} tool
++ * @returns {Record<string, unknown>}
++ */
++export function normalizeToolArgumentsForSchema(args, tool) {
++  if (!args || typeof args !== "object") return {};
++  const properties = toolParameterProperties(tool);
++  if (!properties.length) return { ...args };
++
++  const normalizedProperties = new Map(
++    properties.map((property) => [normalizeToolNameKey(property), property]),
++  );
++  const output = {};
++
++  for (const [key, value] of Object.entries(args)) {
++    let target = key;
++    if (!properties.includes(key)) {
++      target =
++        normalizedProperties.get(normalizeToolNameKey(key)) ||
++        (properties.includes(ARG_KEY_ALIASES[normalizeToolNameKey(key)])
++          ? ARG_KEY_ALIASES[normalizeToolNameKey(key)]
++          : undefined);
++
++      if (!target) {
++        const aliasTarget = ARG_KEY_ALIASES[normalizeToolNameKey(key)];
++        if (aliasTarget && properties.includes(aliasTarget) && !properties.includes(key)) {
++          target = aliasTarget;
++        }
++      }
++    }
++    output[target || key] = value;
++  }
++
++  return output;
++}
++
++/**
++ * @param {Array<{ id: string, type: string, function: { name: string, arguments: string } }>} toolCalls
++ * @param {Array<{ name: string, parameters?: Record<string, unknown> }>} clientTools
++ */
++export function normalizeOpenAIToolCalls(toolCalls, clientTools = []) {
++  if (!clientTools.length) return toolCalls;
++
++  return toolCalls.map((toolCall) => {
++    const tool = resolveToolSpec(toolCall.function.name, clientTools);
++    const name = tool?.name ?? toolCall.function.name;
++    let args = {};
++    try {
++      args = JSON.parse(toolCall.function.arguments || "{}");
++    } catch {
++      args = {};
++    }
++    const normalized = normalizeToolArgumentsForSchema(args, tool);
++    return {
++      ...toolCall,
++      function: {
++        name,
++        arguments: JSON.stringify(normalized),
++      },
++    };
++  });
++}
++
+ /**
+  * Remove known Cursor control tokens from text.
+  * @param {string} text
+@@ -128,9 +453,7 @@ export function resolveToolName(raw) {
+ export function stripCursorControlTokens(text) {
+   let out = prepareComposerWireText(text);
+ 
+-  // Drop entire tool-call envelopes (including malformed / truncated).
+   out = out.replace(TOOL_CALLS_ENVELOPE_RE, "");
+-
+   out = out.replace(TOOL_MARKER_RE, "");
+   out = out.replace(TOOL_CALL_BLOCK_RE, "");
+   out = out.replace(MALFORMED_TOOL_END_RE, "");
+@@ -138,7 +461,6 @@ export function stripCursorControlTokens(text) {
+   out = out.replace(WIRE_FRAGMENT_RE, "");
+   out = out.split("<|final|>").join("");
+ 
+-  // Orphan lines from partial parses (tool name / arg keys without values).
+   out = out
+     .split("\n")
+     .filter((line) => {
+@@ -154,7 +476,6 @@ export function stripCursorControlTokens(text) {
+ }
+ 
+ /**
+- * Flatten tool-call inner payload into [toolName, key, value, key, value, ...].
+  * @param {string} inner
+  * @returns {string[]}
+  */
+@@ -171,8 +492,94 @@ export function tokenizeToolCallInner(inner) {
+     .filter(Boolean);
+ }
+ 
++function parseComposerToolArgument(value) {
++  if (!value) return "";
++  if (value === "true") return true;
++  if (value === "false") return false;
++  if (value === "null") return null;
++  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
++  if (
++    (value.startsWith("{") && value.endsWith("}")) ||
++    (value.startsWith("[") && value.endsWith("]"))
++  ) {
++    try {
++      return JSON.parse(value);
++    } catch {
++      return value;
++    }
++  }
++  return value;
++}
++
++function parseJsonToolCallBody(value) {
++  const trimmed = value.trim();
++  const jsonText = trimmed.startsWith("{") ? trimmed : extractJsonObject(trimmed);
++  if (!jsonText) return null;
++  try {
++    const parsed = JSON.parse(jsonText);
++    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
++    if (typeof parsed.name !== "string" || !parsed.name.trim()) return null;
++    let args = {};
++    if (parsed.arguments && typeof parsed.arguments === "object" && !Array.isArray(parsed.arguments)) {
++      args = parsed.arguments;
++    } else if (typeof parsed.arguments === "string" && parsed.arguments.trim()) {
++      try {
++        const decoded = JSON.parse(parsed.arguments);
++        if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) args = decoded;
++      } catch {
++        args = {};
++      }
++    }
++    return { name: resolveToolName(parsed.name.trim()), args };
++  } catch {
++    return null;
++  }
++}
++
++function splitInlineArguments(value) {
++  const parts = [];
++  let start = 0;
++  let quote = null;
++  let depth = 0;
++  for (let i = 0; i < value.length; i += 1) {
++    const char = value[i];
++    if (quote) {
++      if (char === quote && value[i - 1] !== "\\") quote = null;
++      continue;
++    }
++    if (char === '"' || char === "'") {
++      quote = char;
++      continue;
++    }
++    if (char === "{" || char === "[") depth += 1;
++    if (char === "}" || char === "]") depth = Math.max(0, depth - 1);
++    if (char === "," && depth === 0) {
++      parts.push(value.slice(start, i));
++      start = i + 1;
++    }
++  }
++  parts.push(value.slice(start));
++  return parts;
++}
++
++function parseInlineToolCall(value) {
++  const match = /^([A-Za-z0-9_.-]+)\s*(?:\(([\s\S]*)\)|\[([\s\S]*)\])?$/.exec(value.trim());
++  if (!match) return null;
++  const name = resolveToolName(match[1]?.trim() || "");
++  if (!name) return null;
++  const rawArgs = (match[2] ?? match[3] ?? "").trim();
++  const args = {};
++  if (rawArgs) {
++    for (const part of splitInlineArguments(rawArgs)) {
++      const argMatch = /^([A-Za-z0-9_.-]+)\s*[:=]\s*([\s\S]*)$/.exec(part.trim());
++      if (!argMatch?.[1]) continue;
++      args[argMatch[1]] = parseComposerToolArgument((argMatch[2] ?? "").trim());
++    }
++  }
++  return { name, args };
++}
++
+ /**
+- * Parse key/value tokens after tool name.
+  * @param {string[]} tokens
+  * @returns {Record<string, unknown>}
+  */
+@@ -188,8 +595,9 @@ function parseToolArgumentsFromTokens(tokens) {
+     }
+ 
+     if (seg.startsWith("{")) {
++      const jsonText = extractJsonObject(seg) || seg;
+       try {
+-        const parsed = JSON.parse(seg);
++        const parsed = JSON.parse(jsonText);
+         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+           Object.assign(args, parsed);
+           i += 1;
+@@ -204,13 +612,13 @@ function parseToolArgumentsFromTokens(tokens) {
+     if (spaceIdx > 0) {
+       const key = seg.slice(0, spaceIdx).trim();
+       const value = seg.slice(spaceIdx + 1).trim();
+-      if (key) args[key] = value;
++      if (key) args[key] = parseComposerToolArgument(value);
+       i += 1;
+       continue;
+     }
+ 
+     if (/^[a-z_][a-z0-9_]*$/i.test(seg) && i + 1 < tokens.length) {
+-      args[seg] = tokens[i + 1];
++      args[seg] = parseComposerToolArgument(tokens[i + 1]);
+       i += 2;
+       continue;
+     }
+@@ -225,11 +633,19 @@ function parseToolArgumentsFromTokens(tokens) {
+ }
+ 
+ /**
+- * Parse one Composer tool-call block inner payload.
+  * @param {string} inner
+  * @returns {{ name: string, args: Record<string, unknown> } | null}
+  */
+ export function parseComposerToolCallBlock(inner) {
++  const trimmed = inner?.trim();
++  if (!trimmed) return null;
++
++  const jsonBody = parseJsonToolCallBody(trimmed);
++  if (jsonBody) return jsonBody;
++
++  const inlineOnly = parseInlineToolCall(trimmed);
++  if (inlineOnly && !trimmed.includes("\n")) return inlineOnly;
++
+   const tokens = tokenizeToolCallInner(inner);
+   if (tokens.length === 0) return null;
+ 
+@@ -250,10 +666,6 @@ export function parseComposerToolCallBlock(inner) {
+ }
+ 
+ /**
+- * Parse tool calls from envelope inner text when strict begin/end pairs are missing.
+- * Handles production malformed streams:
+- *   <｜tool▁calls▁begin｜><|tead
+- *   <｜tool▁sep｜>path\n/home/...\n<|tool_call_ennd|>
+  * @param {string} inner
+  * @returns {Array<{ name: string, args: Record<string, unknown> }>}
+  */
+@@ -280,52 +692,93 @@ export function parseLenientEnvelopeInner(inner) {
+   return calls;
+ }
+ 
++function parseStrictMarkerEnvelope(text) {
++  const normalized = prepareComposerWireText(text);
++  const begin = findComposerToolMarker(normalized, "tool_calls_begin");
++  if (!begin) return [];
++
++  const afterBegin = normalized.slice(begin.index + begin.length);
++  const end = findComposerToolMarker(afterBegin, "tool_calls_end");
++  const body = end ? afterBegin.slice(0, end.index) : afterBegin;
++
++  const calls = [];
++  let searchFrom = 0;
++  for (;;) {
++    const slice = body.slice(searchFrom);
++    const callBegin = findComposerToolMarker(slice, "tool_call_begin");
++    if (!callBegin) break;
++
++    const contentStart = callBegin.index + callBegin.length;
++    const afterContentStart = slice.slice(contentStart);
++    const callEnd = findComposerToolMarker(afterContentStart, "tool_call_end");
++    const callBody = callEnd
++      ? afterContentStart.slice(0, callEnd.index)
++      : afterContentStart;
++
++    const parsed = parseComposerToolCallBlock(callBody);
++    if (parsed) calls.push(parsed);
++
++    if (!callEnd) break;
++    searchFrom += contentStart + callEnd.index + callEnd.length;
++  }
++
++  return calls;
++}
++
+ /**
+- * Convert parsed tool call to OpenAI chat.completion tool_calls entry.
+- * @param {{ name: string, args: Record<string, unknown> }} parsed
+- * @returns {{ id: string, type: "function", function: { name: string, arguments: string } }}
++ * @param {{ name: string, args: Record<string, unknown>, id?: string }} parsed
++ * @param {Array<{ name: string, parameters?: Record<string, unknown> }>} [clientTools]
+  */
+-export function toOpenAIToolCall(parsed) {
++export function toOpenAIToolCall(parsed, clientTools = []) {
++  const tool = resolveToolSpec(parsed.name, clientTools);
++  const name = tool?.name ?? parsed.name;
++  const args = normalizeToolArgumentsForSchema(parsed.args ?? {}, tool);
+   return {
+-    id: nextToolCallId(),
++    id: parsed.id || nextToolCallId(),
+     type: "function",
+     function: {
+-      name: parsed.name,
+-      arguments: JSON.stringify(parsed.args ?? {}),
++      name,
++      arguments: JSON.stringify(args),
+     },
+   };
+ }
+ 
+ /**
+- * Strip Composer tool markers and parse embedded tool calls from assistant text.
+  * @param {string} raw
+- * @returns {{ content: string | null, toolCalls: ReturnType<typeof toOpenAIToolCall>[] }}
++ * @param {Array<{ name: string, parameters?: Record<string, unknown> }>} [clientTools]
+  */
+-export function processComposerAssistantText(raw) {
++export function processComposerAssistantText(raw, clientTools = []) {
+   if (!raw) {
+     return { content: null, toolCalls: [] };
+   }
+ 
+-  const prepared = prepareComposerWireText(raw);
++  const sanitized = sanitizeForParsing(raw);
++  const prepared = prepareComposerWireText(sanitized);
+   const promoted = normalizePromotedText(prepared);
+   const text = promoted || prepared;
+   const toolCalls = [];
+-  const blocks = [];
+   const consumedRanges = [];
+ 
+   TOOL_CALL_BLOCK_RE.lastIndex = 0;
+   let match = TOOL_CALL_BLOCK_RE.exec(text);
+   while (match) {
+-    blocks.push({ full: match[0], inner: match[1], start: match.index });
++    const parsed = parseComposerToolCallBlock(match[1]);
++    if (parsed) toolCalls.push(parsed);
++    consumedRanges.push([match.index, match.index + match[0].length]);
+     match = TOOL_CALL_BLOCK_RE.exec(text);
+   }
+ 
+-  for (const block of blocks) {
+-    const parsed = parseComposerToolCallBlock(block.inner);
+-    if (parsed) {
+-      toolCalls.push(parsed);
++  if (toolCalls.length === 0) {
++    const strictCalls = parseStrictMarkerEnvelope(text);
++    if (strictCalls.length > 0) {
++      toolCalls.push(...strictCalls);
++      TOOL_CALLS_ENVELOPE_RE.lastIndex = 0;
++      let envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++      while (envelopeMatch) {
++        consumedRanges.push([envelopeMatch.index, envelopeMatch.index + envelopeMatch[0].length]);
++        envelopeMatch = TOOL_CALLS_ENVELOPE_RE.exec(text);
++      }
+     }
+-    consumedRanges.push([block.start, block.start + block.full.length]);
+   }
+ 
+   if (toolCalls.length === 0) {
+@@ -342,6 +795,11 @@ export function processComposerAssistantText(raw) {
+     }
+   }
+ 
++  if (toolCalls.length === 0) {
++    const anthropicCalls = parseToolCallsFromAnthropicIds(text);
++    toolCalls.push(...anthropicCalls);
++  }
++
+   let content = text;
+   for (const [start, end] of consumedRanges.sort((a, b) => b[0] - a[0])) {
+     content = content.slice(0, start) + content.slice(end);
+@@ -351,25 +809,29 @@ export function processComposerAssistantText(raw) {
+ 
+   return {
+     content: content || null,
+-    toolCalls: toolCalls.map((parsed) => toOpenAIToolCall(parsed)),
++    toolCalls: toolCalls.map((parsed) => toOpenAIToolCall(parsed, clientTools)),
+   };
+ }
+ 
+ /**
+- * Merge protobuf tool calls with text-parsed tool calls (protobuf wins).
+  * @param {string} totalContent
+  * @param {string} totalThinking
+  * @param {boolean} promoteThinking
+  * @param {Array<{ id: string, type: string, function: { name: string, arguments: string } }>} protobufToolCalls
+- * @returns {{ content: string | null, toolCalls: typeof protobufToolCalls }}
++ * @param {Array<{ name: string, parameters?: Record<string, unknown> }>} [clientTools]
+  */
+-export function finalizeAssistantOutput(totalContent, totalThinking, promoteThinking, protobufToolCalls) {
+-  const rawText = totalContent
+-    || (promoteThinking ? totalThinking : "")
+-    || "";
+-
+-  const { content, toolCalls: textToolCalls } = processComposerAssistantText(rawText);
+-  const toolCalls = protobufToolCalls.length > 0 ? protobufToolCalls : textToolCalls;
++export function finalizeAssistantOutput(
++  totalContent,
++  totalThinking,
++  promoteThinking,
++  protobufToolCalls,
++  clientTools = [],
++) {
++  const rawText = totalContent || (promoteThinking ? totalThinking : "") || "";
++
++  const { content, toolCalls: textToolCalls } = processComposerAssistantText(rawText, clientTools);
++  let toolCalls = protobufToolCalls.length > 0 ? protobufToolCalls : textToolCalls;
++  toolCalls = normalizeOpenAIToolCalls(toolCalls, clientTools);
+ 
+   let finalContent = content;
+   if (!finalContent && protobufToolCalls.length > 0) {
+@@ -382,14 +844,15 @@ export function finalizeAssistantOutput(totalContent, totalThinking, promoteThin
+ }
+ 
+ /**
+- * Incrementally emit clean assistant text while buffering Composer control tokens.
++ * Incrementally emit clean assistant text while buffering partial Composer markers.
+  */
+ export class StreamingComposerFilter {
+-  /** @param {boolean} [promoteThinking] */
+-  constructor(promoteThinking = false) {
++  /** @param {boolean} [promoteThinking] @param {Array<{ name: string, parameters?: Record<string, unknown> }>} [clientTools] */
++  constructor(promoteThinking = false, clientTools = []) {
+     this.rawBuffer = "";
+     this.emittedContentLength = 0;
+     this.promoteThinking = promoteThinking;
++    this.clientTools = clientTools;
+   }
+ 
+   /** @param {string} text */
+@@ -397,13 +860,20 @@ export class StreamingComposerFilter {
+     this.rawBuffer = text || "";
+   }
+ 
++  /** @returns {string} */
++  getSafeRawForContent() {
++    const prefixIndex = toolMarkerPrefixIndex(this.rawBuffer);
++    return prefixIndex === -1 ? this.rawBuffer : this.rawBuffer.slice(0, prefixIndex);
++  }
++
+   /** @returns {string} */
+   getContentDelta() {
+     if (this.promoteThinking && !hasComposerWireMarkers(this.rawBuffer)) {
+       return "";
+     }
+ 
+-    const { content } = processComposerAssistantText(this.rawBuffer);
++    const safeRaw = this.getSafeRawForContent();
++    const { content } = processComposerAssistantText(safeRaw, this.clientTools);
+     const safe = content || "";
+     const delta = safe.slice(this.emittedContentLength);
+     this.emittedContentLength = safe.length;
+@@ -411,6 +881,6 @@ export class StreamingComposerFilter {
+   }
+ 
+   getTextToolCalls() {
+-    return processComposerAssistantText(this.rawBuffer).toolCalls;
++    return processComposerAssistantText(this.rawBuffer, this.clientTools).toolCalls;
+   }
+ }
+diff --git a/open-sse/utils/cursorProtobuf.js b/open-sse/utils/cursorProtobuf.js
+index c870921..3457116 100644
+--- a/open-sse/utils/cursorProtobuf.js
++++ b/open-sse/utils/cursorProtobuf.js
+@@ -149,6 +149,8 @@ const FIELD = {
+   // StreamUnifiedChatResponseWithTools (response)
+   TOOL_CALL: 1,
+   RESPONSE: 2,
++  TOOL_CALL_LEGACY: 13,
++  TOOL_CALL_V2: 36,
+ 
+   // ClientSideToolV2Call
+   TOOL_ID: 3,
+@@ -177,6 +179,8 @@ const FIELD = {
+ const KNOWN_RESPONSE_FIELDS = new Set([
+   FIELD.TOOL_CALL,
+   FIELD.RESPONSE,
++  FIELD.TOOL_CALL_LEGACY,
++  FIELD.TOOL_CALL_V2,
+   FIELD.TOOL_ID,
+   FIELD.TOOL_NAME,
+   FIELD.TOOL_RAW_ARGS,
+@@ -761,34 +765,36 @@ function extractToolCall(toolCallData) {
+ 
+   // Extract tool call ID
+   if (toolCall.has(FIELD.TOOL_ID)) {
+-    const fullId = new TextDecoder().decode(toolCall.get(FIELD.TOOL_ID)[0].value);
++    const fullId = textDecoder.decode(toolCall.get(FIELD.TOOL_ID)[0].value);
+     toolCallId = fullId.split("\n")[0]; // Cursor returns multi-line ID, take first line
+   }
+ 
+   // Extract tool name
+   if (toolCall.has(FIELD.TOOL_NAME)) {
+-    toolName = new TextDecoder().decode(toolCall.get(FIELD.TOOL_NAME)[0].value);
++    toolName = textDecoder.decode(toolCall.get(FIELD.TOOL_NAME)[0].value);
+   }
+ 
+   // Extract is_last flag
+   if (toolCall.has(FIELD.TOOL_IS_LAST)) {
+     isLast = toolCall.get(FIELD.TOOL_IS_LAST)[0].value !== 0;
++  } else if (toolCall.has(FIELD.TOOL_IS_LAST_ALT)) {
++    isLast = toolCall.get(FIELD.TOOL_IS_LAST_ALT)[0].value !== 0;
+   }
+ 
+   // Extract MCP params - nested real tool info
+   if (toolCall.has(FIELD.TOOL_MCP_PARAMS)) {
+     try {
+       const mcpParams = decodeMessage(toolCall.get(FIELD.TOOL_MCP_PARAMS)[0].value);
+-      
++
+       if (mcpParams.has(FIELD.MCP_TOOLS_LIST)) {
+         const tool = decodeMessage(mcpParams.get(FIELD.MCP_TOOLS_LIST)[0].value);
+-        
++
+         if (tool.has(FIELD.MCP_NESTED_NAME)) {
+-          toolName = new TextDecoder().decode(tool.get(FIELD.MCP_NESTED_NAME)[0].value);
++          toolName = textDecoder.decode(tool.get(FIELD.MCP_NESTED_NAME)[0].value);
+         }
+-        
++
+         if (tool.has(FIELD.MCP_NESTED_PARAMS)) {
+-          rawArgs = new TextDecoder().decode(tool.get(FIELD.MCP_NESTED_PARAMS)[0].value);
++          rawArgs = textDecoder.decode(tool.get(FIELD.MCP_NESTED_PARAMS)[0].value);
+         }
        }
-   
-       if (/^[a-z_][a-z0-9_]*$/i.test(seg) && i + 1 < tokens.length) {
-  -      args[seg] = tokens[i + 1];
-  +      args[seg] = parseComposerToolArgument(tokens[i + 1]);
-         i += 2;
-         continue;
+     } catch (err) {
+@@ -798,7 +804,7 @@ function extractToolCall(toolCallData) {
+ 
+   // Fallback to raw_args
+   if (!rawArgs && toolCall.has(FIELD.TOOL_RAW_ARGS)) {
+-    rawArgs = new TextDecoder().decode(toolCall.get(FIELD.TOOL_RAW_ARGS)[0].value);
++    rawArgs = textDecoder.decode(toolCall.get(FIELD.TOOL_RAW_ARGS)[0].value);
+   }
+ 
+   if (toolCallId && toolName) {
+@@ -816,6 +822,110 @@ function extractToolCall(toolCallData) {
+   return null;
+ }
+ 
++/** ToolCallV2 (field 36) — timxx/Cursor-To-OpenAI schema. */
++function extractToolCallV2(toolCallData) {
++  const toolCall = decodeMessage(toolCallData);
++  let toolCallId = "";
++  let toolName = "";
++  let rawArgs = "";
++
++  if (toolCall.has(FIELD.TOOL_ID)) {
++    toolCallId = textDecoder.decode(toolCall.get(FIELD.TOOL_ID)[0].value).split("\n")[0];
++  }
++  if (toolCall.has(FIELD.TOOL_NAME)) {
++    toolName = textDecoder.decode(toolCall.get(FIELD.TOOL_NAME)[0].value);
++  }
++  if (toolCall.has(FIELD.TOOL_RAW_ARGS)) {
++    rawArgs = textDecoder.decode(toolCall.get(FIELD.TOOL_RAW_ARGS)[0].value);
++  }
++
++  if (toolCall.has(FIELD.TOOL_MCP_PARAMS)) {
++    try {
++      const mcpParams = decodeMessage(toolCall.get(FIELD.TOOL_MCP_PARAMS)[0].value);
++      if (mcpParams.has(FIELD.MCP_TOOLS_LIST)) {
++        const tool = decodeMessage(mcpParams.get(FIELD.MCP_TOOLS_LIST)[0].value);
++        if (tool.has(FIELD.MCP_NESTED_NAME)) {
++          toolName = textDecoder.decode(tool.get(FIELD.MCP_NESTED_NAME)[0].value);
++        }
++        if (tool.has(FIELD.MCP_NESTED_PARAMS)) {
++          rawArgs = textDecoder.decode(tool.get(FIELD.MCP_NESTED_PARAMS)[0].value);
++        }
++      }
++    } catch (err) {
++      log("EXTRACT", `ToolCallV2 MCP parse error: ${err.message}`);
++    }
++  }
++
++  if (toolCallId && toolName) {
++    return {
++      id: toolCallId,
++      type: "function",
++      function: {
++        name: toolName,
++        arguments: rawArgs || "{}"
++      },
++      isLast: true
++    };
++  }
++
++  return null;
++}
++
++/** Legacy ToolCallV1 (field 13) — timxx schema. */
++function extractToolCallLegacy(toolCallData) {
++  const toolCall = decodeMessage(toolCallData);
++  let toolCallId = "";
++  let toolName = "";
++  let rawArgs = "";
++
++  const idField = toolCall.get(1)?.[0]?.value;
++  const nameField = toolCall.get(2)?.[0]?.value;
++  const argsField = toolCall.get(3)?.[0]?.value;
++
++  if (idField) toolCallId = textDecoder.decode(idField).split("\n")[0];
++  if (nameField) toolName = textDecoder.decode(nameField);
++  if (argsField) rawArgs = textDecoder.decode(argsField);
++
++  if (toolCallId && toolName) {
++    return {
++      id: toolCallId,
++      type: "function",
++      function: {
++        name: toolName,
++        arguments: rawArgs || "{}"
++      },
++      isLast: true
++    };
++  }
++
++  return null;
++}
++
++function extractToolCallFromFields(fields) {
++  if (fields.has(FIELD.TOOL_CALL)) {
++    const toolCall = extractToolCall(fields.get(FIELD.TOOL_CALL)[0].value);
++    if (toolCall) return toolCall;
++  }
++
++  if (fields.has(FIELD.TOOL_CALL_V2)) {
++    const toolCall = extractToolCallV2(fields.get(FIELD.TOOL_CALL_V2)[0].value);
++    if (toolCall) {
++      log("EXTRACT", `ToolCallV2: ${toolCall.function.name}`);
++      return toolCall;
++    }
++  }
++
++  if (fields.has(FIELD.TOOL_CALL_LEGACY)) {
++    const toolCall = extractToolCallLegacy(fields.get(FIELD.TOOL_CALL_LEGACY)[0].value);
++    if (toolCall) {
++      log("EXTRACT", `ToolCallLegacy: ${toolCall.function.name}`);
++      return toolCall;
++    }
++  }
++
++  return null;
++}
++
+ function extractTextAndThinking(responseData) {
+   const nested = decodeMessage(responseData);
+   let text = null;
+@@ -855,18 +965,24 @@ export function extractTextFromResponse(payload) {
        }
-  @@ -225,11 +633,19 @@ function parseToolArgumentsFromTokens(tokens) {
-  - * Parse one Composer tool-call block inner payload.
-    * @param {string} inner
-    * @returns {{ name: string, args: Record<string, unknown> } | null}
-    */
-   export function parseComposerToolCallBlock(inner) {
-  +  const trimmed = inner?.trim();
-  +  if (!trimmed) return null;
-  +
-  +  const jsonBody = parseJsonToolCallBody(trimmed);
-  +  if (jsonBody) return jsonBody;
-  +
-  +  const inlineOnly = parseInlineToolCall(trimmed);
-  +  if (inlineOnly && !trimmed.includes("\n")) return inlineOnly;
-  +
-     const tokens = tokenizeToolCallInner(inner);
-     if (tokens.length === 0) return null;
-   
-  @@ -250,10 +666,6 @@ export function parseComposerToolCallBlock(inner) {
-  - * Parse tool calls from envelope inner text when strict begin/end pairs are missing.
-  - * Handles production malformed streams:
-  - *   <｜tool▁calls▁begin｜><|tead
-  - *   <｜tool▁sep｜>path\n/home/...\n<|tool_call_ennd|>
-    * @param {string} inner
-    * @returns {Array<{ name: string, args: Record<string, unknown> }>}
-    */
-  @@ -280,52 +692,93 @@ export function parseLenientEnvelopeInner(inner) {
-  +function parseStrictMarkerEnvelope(text) {
-  +  const normalized = prepareComposerWireText(text);
-  +  const begin = findComposerToolMarker(normalized, "tool_calls_begin");
-  +  if (!begin) return [];
-  +
-  +  const afterBegin = normalized.slice(begin.index + begin.length);
-  +  const end = findComposerToolMarker(afterBegin, "tool_calls_end");
-  +  const body = end ? afterBegin.slice(0, end.index) : afterBegin;
-
-... (more changes truncated)
-  +439 -19
-[full diff: rtk git diff --no-compact]
+     }
+ 
+-    // Field 1: ClientSideToolV2Call
+-    if (fields.has(FIELD.TOOL_CALL)) {
+-      const toolCall = extractToolCall(fields.get(FIELD.TOOL_CALL)[0].value);
+-      if (toolCall) {
+-        log("EXTRACT", `Tool call: ${toolCall.function.name}`);
+-        return { text: null, error: null, toolCall, thinking: null };
+-      }
++    // Field 1 / 13 / 36: tool call variants
++    const toolCall = extractToolCallFromFields(fields);
++    if (toolCall) {
++      log("EXTRACT", `Tool call: ${toolCall.function.name}`);
++      return { text: null, error: null, toolCall, thinking: null };
+     }
+ 
+     // Field 2: StreamUnifiedChatResponse
+     if (fields.has(FIELD.RESPONSE)) {
+-      const { text, thinking } = extractTextAndThinking(fields.get(FIELD.RESPONSE)[0].value);
++      const responseData = fields.get(FIELD.RESPONSE)[0].value;
++      const nestedFields = decodeMessage(responseData);
++      const nestedToolCall = extractToolCallFromFields(nestedFields);
++      if (nestedToolCall) {
++        log("EXTRACT", `Nested tool call: ${nestedToolCall.function.name}`);
++        return { text: null, error: null, toolCall: nestedToolCall, thinking: null };
++      }
++
++      const { text, thinking } = extractTextAndThinking(responseData);
+ 
+       if (text || thinking) {
+         return { text, error: null, toolCall: null, thinking };
+diff --git a/tests/unit/cursor-composer-tools.test.js b/tests/unit/cursor-composer-tools.test.js
+index eebd1d1..15262ff 100644
+--- a/tests/unit/cursor-composer-tools.test.js
++++ b/tests/unit/cursor-composer-tools.test.js
+@@ -5,6 +5,8 @@ import {
+   parseComposerToolCallBlock,
+   processComposerAssistantText,
+   stripCursorControlTokens,
++  StreamingComposerFilter,
++  toolMarkerPrefixIndex,
+ } from "../../open-sse/utils/cursorComposerTools.js";
+ import { CursorExecutor } from "../../open-sse/executors/cursor.js";
+ import { encodeField, wrapConnectRPCFrame } from "../../open-sse/utils/cursorProtobuf.js";
+@@ -160,6 +162,47 @@ describe("cursorComposerTools", () => {
+     expect(JSON.stringify({ content, toolCalls })).not.toMatch(/tead|tool_sep|tool_call/i);
+   });
+ 
++  it("parses JSON tool-call body", () => {
++    const inner = '{"name":"Read","arguments":{"file_path":"/tmp/x.md"}}';
++    expect(parseComposerToolCallBlock(inner)).toEqual({
++      name: "Read",
++      args: { file_path: "/tmp/x.md" },
++    });
++  });
++
++  it("remaps file_path to path when client schema uses path", () => {
++    const clientTools = [{ name: "Read", parameters: { properties: { path: { type: "string" } } } }];
++    const { toolCalls } = processComposerAssistantText(
++      [
++        W.toolCallsBegin + W.toolCallBegin,
++        '{"name":"Read","arguments":{"file_path":"/tmp/x.md"}}',
++        W.toolCallEnd + W.toolCallsEnd,
++      ].join(""),
++      clientTools,
++    );
++    expect(JSON.parse(toolCalls[0].function.arguments)).toEqual({ path: "/tmp/x.md" });
++  });
++
++  it("parses inline bracket Glob arguments", () => {
++    const inner = "Glob [targeting=/tmp, glob_pattern=*.md]";
++    expect(parseComposerToolCallBlock(inner)).toEqual({
++      name: "Glob",
++      args: { targeting: "/tmp", glob_pattern: "*.md" },
++    });
++  });
++
++  it("buffers partial marker suffix during streaming", () => {
++    const partial = "Visible text\n<|redacted_tool_calls_beg";
++    expect(toolMarkerPrefixIndex(partial)).toBeGreaterThan(0);
++
++    const filter = new StreamingComposerFilter(false);
++    filter.setRaw(partial);
++    const delta = filter.getContentDelta();
++    expect(delta).toContain("Visible text");
++    expect(delta).not.toMatch(/redacted|tool_calls/i);
++    expect(filter.getContentDelta()).toBe("");
++  });
++
+   it("extracts tool_calls and clean content from composer markers", () => {
+     const raw = [
+       "internal plan</think>",
