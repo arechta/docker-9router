@@ -37,7 +37,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -sf --connect-timeout 5 \"http://127.0.0.1:$${PORT:-20128}/\" >/dev/null || exit 1",
+          "curl -sfL --connect-timeout 5 \"http://127.0.0.1:$${PORT:-20128}/\" >/dev/null || exit 1",
         ]
       interval: 30s
       timeout: 10s
